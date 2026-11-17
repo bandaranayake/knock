@@ -11,6 +11,7 @@ mod pipeline;
 mod platform;
 mod server;
 mod settings;
+mod snapshot;
 mod strip;
 mod tray;
 

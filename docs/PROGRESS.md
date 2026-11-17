@@ -37,10 +37,39 @@ Done:
   - ADR 0037, restoring sessions after a restart: a Needs-you session knocks again with no second notification; a session whose program is gone shows "Session ended".
   - ADR 0038, a `get_diagnostics()` command: Settings shows the version and gets a **Copy diagnostics** button.
   - ADR 0039, deferred finding (4): setup opens by itself only until it has been finished once.
+- `phase-5/doctor` merged into `develop` (ea92203). Manual test for `knock doctor` given to the user; result not in yet.
+- Branch `phase-5/restore` created from `develop`. Two briefs are in flight on it:
+  - Brief 5.2 (`core-windows`), FR-13 restore. The agent stopped once on a usage limit and was resumed; `knock-core` has `Engine::restore`, `Saved`, `SavedNeeds`, `Liveness` and `RestoreError`, and the app-shell side is still to come.
+    - Lead note sent: the ADR 0019 test assertion "an episode always waits on at least one requester" must hold across a restore (counting the unknown requester), not be deleted.
+  - Brief 5.3 (`ui`), the UI side of ADR 0038: the version line and the **Copy diagnostics** button, built against the dev mock. The core side of `get_diagnostics()` is a later brief.
+- Lead survey of the deferred finding (5): all three misleading messages are core-side strings (`hooks.rs` `NoServer`, `main.rs` `CANT_START` and the health check's server detail). The one about "Choose Repair" with no button is the setup Connect screen, which shows the `NoServer` text while only Settings has a Repair button. They go in brief 5.4 with ADR 0039, after 5.2 merges, because they share `src-tauri` paths.
+- Brief 5.3 (`ui`) done and committed (df2a99a): the version line and **Copy diagnostics** in Settings, against the dev mock. Lead review passed; 139 Vitest and 88 settings screenshot tests pass, Biome clean, scope clean. Not user-testable until the core side exists.
+  - Deviations accepted by the lead: two short sentences instead of one beside the button; "Copied" clears after 8 s so the screenshot test doesn't flake; a `diagnostics.ts` module, since Vitest here tests pure logic and Playwright tests rendering.
+- Lead found: `pnpm test:visual` had 5 failing overlay screenshots (13-122 px, threshold 10), caused by an Edge update, not by any change: nothing in `overlay/` or `art/` had changed since the baselines of 2026-11-04 (1ff0a25). The lead opened the `icons` diff image and saw only anti-aliasing on edges. Brief 5.5 sent to `ui` to confirm each diff and regenerate only those five.
+- Lead found: `.github/workflows/ci.yml` runs only `pnpm check`, `cargo fetch --locked`, `cargo-deny` and `pnpm audit`. §13.4 also lists `pnpm test:visual`, `pnpm art:check`, a Windows build and a smoke test; none of them has ever run on GitHub.
+  - **ADR 0040, approved by the user on 2026-11-17:** CI gains `art:check`, the Windows build and the smoke test. `pnpm test:visual` stays local, run by the lead before merging any UI or art change, with the anti-aliasing check before any baseline is regenerated. The threshold stays at 10. SPEC.md §13.4 amended.
+- Brief 5.2 (`core-windows`) done and committed (f6881dc): sessions are restored at start (FR-13), with each process re-checked by PID and start time. Lead review passed; `pnpm check` passes (141 desktop, 44 engine, 27 restore, 2 invariants, 139 Vitest). Scope clean. Fresh review running (§11 rule 4 and 5 are in play), so not merged yet.
+  - `knock-core` stays pure: `Engine::restore` takes plain `Saved` data and the restore time. The new `snapshot.rs` is the only reader of `sessions.json`; the liveness check is passed in as a closure, so no OS call lives there.
+  - Snapshot: `turnDone` added (default `false`), so a file the released version wrote still restores. `simulated` is read and refused although it is never written.
+  - Invariants now generate restore points: snapshot → restore → continue, with each process randomly alive, gone or unknown.
+  - Existing tests changed, all justified and verified by the lead: the ADR 0019 "an open episode always waits on at least one requester" assertion now counts the unknown requester, as the lead instructed; the requester model accepts the unknown one; `snapshot_holds_no_agent_id_cwd_or_free_text` extended to the new keys and to a restored `Core`.
+  - Clarifications (lead), from the agent's open questions:
+    - A restored episode in which the main agent made its own request after the restart keeps knocking when that agent's `Stop` arrives, because the pre-restart requester may have been a sub-agent. `turn.started`, `agent.failed` and `session.ended` still close it, so it can't stick.
+    - An unknown `activity` or `precision` string refuses the whole file, like any other entry Knock can't understand (item 7).
+    - No length or charset check on `project`, `projectKey` or `animal`: Knock is the only writer, and the overlay already falls back to the fox for an unknown animal id (Phase 3 decision, with a visual test).
+    - **To do in brief 5.4:** the health check's "last heard from Claude Code" is not restored, so after a restart it says Knock has heard nothing until the first hook arrives. FR-12 says the health check reports the last event time, so it should read the saved `lastEventMs`. This also feeds `GET /v1/health` and `knock doctor`.
+- Fresh review of f6881dc (ADR 0029): §11 rules 4 and 5 hold, §7.3 holds, and ADR 0037 items 1, 2, 4, 6, 7 and 8 check out. Three findings, all verified by the lead in the committed tests, all sent back as brief 5.2a:
+  - **(1) A missed knock.** For a restored episode, `turn.completed` consumed the unknown requester, so a session whose sub-agent was waiting became "Done, ready to review" when the main agent's turn ended, while the permission prompt sat unanswered and nothing could bring it back. Breaks §6 Reliability. The code exceeded ADR 0037 item 5, which gives only `activity` that power, and contradicted the existing §8.4 `turn.completed` row. ADR 0037 item 5 now pins this, with the accepted cost: a lingering knock the user can clear beats a silently lost one.
+  - **(2) The 6-hour clock restarted at every restart** for a session found gone, against §8.4 Restore, ADR 0037 item 4 and the code's own doc comment. A failed session with a closed terminal lingered 6 h from each restart instead of from its last event.
+  - **(3) The health check said "no events" right after a restore**, although every saved entry carries its last-event time. Fixed per FR-12; also feeds `GET /v1/health` and `knock doctor`. Recorded in ADR 0037.
+  - Not changed: `project`, `projectKey` and `animal` are read unchecked. Robustness only, nothing leaves the machine, and the overlay falls back to the fox.
+- Brief 5.5 (`ui`) done and committed (0048226): four overlay baselines regenerated after each diff was confirmed to be anti-aliasing only (13-53 px; same text, layout, poses, badges).
+  - The fifth was **refused**, correctly: `animals-stepping-down` is not drift but a flaky mid-animation capture — the fox one pixel lower, 122 px, intermittent. The lead reproduced it: 1 pass, 3 failures in four runs, identical every time. It has been unreliable since it was written and would fail at random on any machine; ADR 0040 makes that a merge blocker. Brief 5.7 sent to `ui` to fix the timing at its source, with 12 consecutive passes required as evidence. Loosening the threshold, a retry, a mask or a sleep are all ruled out.
 Next:
-- Resolve the fresh review of brief 5.1, merge it, then the user's manual test of `knock doctor`.
-- Brief 5.2, FR-13 restore (`core-windows`); brief 5.3, diagnostics (`core-windows`, then `ui`); brief 5.4, the start-up rule and the deferred finding (5) messages.
-- Then: an error-handling survey, the health check screen polish (`ui`), and the §12.2 manual matrix for v0.9.
+- Review brief 5.2a and brief 5.7, then merge `phase-5/restore` and give the user the manual test for restart recovery.
+- Brief 5.4: the core side of `get_diagnostics()`, the ADR 0039 start-up rule, the restored last-event time, and the finding (5) messages.
+- Brief 5.6 (`core-windows`, `.github/`): make `ci.yml` match the amended §13.4 (ADR 0040).
+- Then: an error-handling survey, the README privacy note for Copy diagnostics (ADR 0038), and the §12.2 manual matrix for v0.9.
 Dependencies added: none
 Clarifications: none
 Open questions for the user:

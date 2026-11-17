@@ -14,10 +14,17 @@
 //! tray count. Each tick it also reads the idle time and sends
 //! `away-summary` when the user returns (FR-9, ADR 0034).
 //! [`Published`] is what the server and the commands read.
+//!
+//! At start [`Core::new`] restores the saved sessions (FR-13, ADR 0037):
+//! `crate::snapshot` reads the file, each recorded process is re-checked
+//! through the platform trait (§9.7), and the engine puts them back. That
+//! happens before anything is published, so the strip's first
+//! `get_sessions()` already shows them.
 
 use crate::jump::{Precision, ProcessId};
 use crate::platform::{self, Platform};
 use crate::settings::{self, Settings};
+use crate::snapshot;
 use knock_core::{
     AWAY_MS, Adapter, Away, AwaySummary, Category, ClaudeCode, Effect, Engine, Event, Input, Kind,
     NeedsKind, Reason, Tier, iso8601,
@@ -31,7 +38,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 
-const SNAPSHOT: &str = "sessions.json";
+const SNAPSHOT: &str = snapshot::FILE;
 /// The test knock's project name and how long it stays.
 const TEST_PROJECT: &str = "Knock test";
 const TEST_MS: u64 = 10_000;
@@ -176,7 +183,8 @@ pub fn read(s: &Shared) -> MutexGuard<'_, Published> {
     s.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A session's process and window, as found by §9.4.
+/// A session's process and window, as found by §9.4, or as restored from
+/// the snapshot with its process re-checked (FR-13).
 struct Found {
     process: ProcessId,
     /// Executable that owns the window, file name only.
@@ -221,8 +229,9 @@ pub struct Core {
 }
 
 impl Core {
-    /// Loads the settings from `dir` and tells the engine whether
-    /// notifications are suppressed before any event (engine module docs).
+    /// Loads the settings from `dir`, tells the engine whether notifications
+    /// are suppressed before any event (engine module docs), then restores
+    /// the saved sessions (FR-13) before publishing anything.
     pub fn new(
         dir: PathBuf,
         platform: Option<Arc<dyn Platform>>,
@@ -243,7 +252,7 @@ impl Core {
                 "away threshold shortened (debug build)"
             );
         }
-        let core = Core {
+        let mut core = Core {
             engine,
             adapter: ClaudeCode { users: users() },
             settings,
@@ -263,8 +272,82 @@ impl Core {
             shared,
         };
         core.restore_sign_in();
+        core.restore(now);
+        core.view = SessionsChanged {
+            rev: 0,
+            sessions: core.views(),
+        };
         core.publish();
         core
+    }
+
+    /// FR-13, ADR 0037: the saved sessions, with each recorded process
+    /// re-checked (§9.7). Emits nothing: no toast, no `sessions-changed`, no
+    /// write. Only the kind of problem is logged (§11.5), and nothing is
+    /// restored unless the whole file is understood (item 7). The tray count
+    /// and the away tracker pick restored sessions up on the first tick.
+    fn restore(&mut self, now: u64) {
+        let platform = self.platform.clone();
+        // Not checked at all without a platform (as [`Core::tick`] does):
+        // the process is left as it was recorded.
+        let alive = |p: &snapshot::Process| match &platform {
+            Some(pl) => pl.process_start(p.pid) == Some(p.start),
+            None => true,
+        };
+        let found = match snapshot::read(&self.dir, alive) {
+            Ok(found) => found,
+            Err(snapshot::Problem::Missing) => {
+                return tracing::info!(file = SNAPSHOT, "no saved sessions");
+            }
+            Err(problem) => {
+                // The kind only: never the body, never a path (§11.5).
+                return tracing::warn!(
+                    file = SNAPSHOT,
+                    ?problem,
+                    "saved sessions not restored; starting with none"
+                );
+            }
+        };
+        let mut saved = Vec::with_capacity(found.len());
+        let mut procs = HashMap::new();
+        for r in found {
+            if let Some(p) = r.process {
+                let found = Found {
+                    process: p.id(),
+                    owner: p.owner,
+                    precision: p.precision,
+                };
+                procs.insert(r.saved.id.clone(), found);
+            }
+            saved.push(r.saved);
+        }
+        let want = saved.len();
+        match self.engine.restore(saved, now) {
+            Ok(restored) => {
+                // Only sessions the engine kept: a simulated one, or one the
+                // 6-hour rule already removes, never comes back (ADR 0018,
+                // 0037 items 1 and 4).
+                let sessions = self.engine.sessions();
+                procs.retain(|id, _| sessions.iter().any(|s| &s.id == id));
+                let live = procs.len();
+                // FR-12: the health check knows when Knock last heard from
+                // Claude Code, so it reports that instead of "no events".
+                // Only the sessions the engine kept count.
+                self.last_event_at = sessions.iter().map(|s| s.last_event).max();
+                self.procs = procs;
+                tracing::info!(
+                    restored,
+                    dropped = want - restored,
+                    live,
+                    "sessions restored"
+                );
+            }
+            Err(problem) => tracing::warn!(
+                file = SNAPSHOT,
+                ?problem,
+                "saved sessions not restored; starting with none"
+            ),
+        }
     }
 
     /// ADR 0027: while `launchAtSignIn` is on, a missing or stale sign-in
@@ -660,8 +743,8 @@ impl Core {
 
     /// `sessions.json`: §11.4 data only. No agent ids (ADR 0019), no cwd
     /// (only its hash), no window titles or handles. Enough to restore from
-    /// (FR-13, Phase 5). Simulated sessions (`knock sim`, the test knock) are
-    /// left out: none is ever restored.
+    /// (FR-13; `crate::snapshot` reads it back). Simulated sessions
+    /// (`knock sim`, the test knock) are left out: none is ever restored.
     fn persist(&self, now: u64) {
         let sessions = (self.engine.sessions().iter())
             .filter(|s| !s.simulated)
@@ -683,6 +766,9 @@ impl Core {
                         "escalated": n.escalated,
                     })),
                     "animal": s.animal,
+                    // ADR 0021, for the restore: whether a restored episode
+                    // closes to `ready` rather than `working`.
+                    "turnDone": s.turn_done(),
                     "process": found.map(|f| serde_json::json!({
                         "pid": f.process.pid,
                         "start": f.process.start,
@@ -1707,6 +1793,8 @@ mod tests {
         assert_eq!(s["needs"]["label"], "Bash");
         assert_eq!(s["process"]["pid"], P1.pid);
         assert_eq!(s["process"]["owner"], "WindowsTerminal.exe");
+        // The restore's own field (ADR 0021): a plain true or false, no id.
+        assert_eq!(s["turnDone"], false);
         let mut keys: Vec<_> = s.as_object().unwrap().keys().cloned().collect();
         keys.sort();
         assert_eq!(
@@ -1721,9 +1809,36 @@ mod tests {
                 "project",
                 "projectKey",
                 "sinceMs",
-                "state"
+                "state",
+                "turnDone"
             ]
         );
+        let mut needs: Vec<_> = s["needs"].as_object().unwrap().keys().cloned().collect();
+        needs.sort();
+        assert_eq!(
+            needs,
+            ["escalated", "kind", "label", "openedMs", "seen"],
+            "the episode keeps no requester (no agent ids)"
+        );
+        // And the restore puts back only what is in the file: still no
+        // agent id, cwd or free text anywhere after a round trip.
+        let back = Core::new(
+            t.dir.clone(),
+            Some(t.core.platform.clone().unwrap()),
+            Shared::default(),
+            T0 + 1000,
+            NOON,
+        );
+        let seen = format!("{:?}", back.view);
+        for bad in [
+            "agentsecret123",
+            "secret-folder",
+            "someone",
+            "C:\\",
+            "secret",
+        ] {
+            assert!(!seen.contains(bad), "{bad} in {seen}");
+        }
     }
 
     // Liveness on the process tables recorded for ADR 0012 (jump.rs tests):
@@ -1765,6 +1880,337 @@ mod tests {
         ];
         assert_eq!(gone(known, start_of), ["reused", "exited"]);
         assert!(gone([], start_of).is_empty());
+    }
+
+    impl T {
+        /// Knock closes and starts again on the same folder at `T0 + t`,
+        /// with the same fake platform (so the same processes are alive).
+        /// Returns the outputs of the restart, which must be none.
+        fn restart(&mut self, t: u64) -> Vec<Out> {
+            self.core.flush();
+            self.shared = Shared::default();
+            let platform: Arc<dyn Platform> = self.fake.clone();
+            self.core = Core::new(
+                self.dir.clone(),
+                Some(platform),
+                self.shared.clone(),
+                T0 + t,
+                self.minute,
+            );
+            Vec::new()
+        }
+        fn views(&self) -> Vec<SessionView> {
+            read(&self.shared).sessions.sessions.clone()
+        }
+    }
+
+    /// FR-13, ADR 0037: a round trip through the file gives the same session
+    /// views, and the strip's first `get_sessions()` already has them.
+    #[test]
+    fn restarting_restores_the_same_sessions_before_anything_is_published() {
+        let mut t = core("restore-round-trip");
+        *t.fake.alive.lock().unwrap() = vec![P1];
+        t.hook(0, "needs", "PermissionRequest", ASK_WRITE, Some(P1));
+        t.hook(1000, "work", "UserPromptSubmit", "", Some(P1));
+        t.hook(2000, "done", "Stop", "", Some(P1));
+        t.core.handle(Msg::Ack("needs".into()), T0 + 3000, NOON);
+        let before = t.views();
+        assert_eq!(before.len(), 3);
+        let outs = t.restart(4000);
+        assert!(outs.is_empty(), "restoring shows nothing");
+        // Already there for the first load, before any tick.
+        assert_eq!(t.views(), before, "same views after the restart");
+        assert_eq!(read(&t.shared).sessions.rev, 0, "the initial load");
+        // The jump still works for a restored session (§9.5). The guard is
+        // dropped before anything else reads `shared`.
+        let (jump, precision) = {
+            let p = read(&t.shared);
+            (p.jump.clone(), p.sessions.sessions[0].precision)
+        };
+        assert_eq!(jump["needs"], (P1, "repo-needs".to_string()));
+        assert_eq!(precision, Precision::AppWindow);
+        // The seen episode is still seen, and no toast on the next tick.
+        let needs = &t.views()[0];
+        assert!(needs.needs.clone().unwrap().seen, "ADR 0016, 0037 item 2");
+        let outs = t.core.tick(T0 + 5000, NOON);
+        assert!(toasts(&outs).is_empty(), "ADR 0037 item 8");
+        // The tray count catches up on the first tick.
+        assert!(outs.contains(&Out::Tray(1)));
+    }
+
+    /// FR-12: after a restore the health check reports when Knock last heard
+    /// from Claude Code, not "no events". It is the newest saved
+    /// `lastEventMs` among the sessions that actually came back.
+    #[test]
+    fn restoring_seeds_the_health_checks_last_event_time() {
+        let mut t = core("restore-last-event");
+        *t.fake.alive.lock().unwrap() = vec![P1];
+        t.hook(0, "a", "UserPromptSubmit", "", Some(P1));
+        t.hook(7000, "b", "Stop", "", Some(P1));
+        assert_eq!(read(&t.shared).last_event_at, Some(T0 + 7000));
+        t.restart(9000);
+        assert_eq!(
+            read(&t.shared).last_event_at,
+            Some(T0 + 7000),
+            "the newest saved event, not none and not the restart"
+        );
+        // A session the 6-hour rule drops on the way in doesn't count: only
+        // "b" survives, so its own last event is reported.
+        let mut t = core("restore-last-event-dropped");
+        t.hook(0, "a", "Stop", "", None);
+        t.hook(1000, "b", "Stop", "", Some(P1));
+        *t.fake.alive.lock().unwrap() = vec![P1];
+        t.restart(6 * 60 * MIN);
+        let ids: Vec<_> = t.views().iter().map(|v| v.id.clone()).collect();
+        assert_eq!(ids, ["b"], "the one with no process is dropped");
+        assert_eq!(read(&t.shared).last_event_at, Some(T0 + 1000));
+        // Nothing restored: nothing to report, as on a first run.
+        let mut t = core("restore-last-event-none");
+        t.restart(1000);
+        assert_eq!(read(&t.shared).last_event_at, None);
+    }
+
+    /// Item 3 and 6 through the whole shell: a live process, one that is
+    /// gone, one whose PID another process now has, and no process at all.
+    #[test]
+    fn restore_rechecks_each_process_by_pid_and_start_time() {
+        let mut t = core("restore-liveness");
+        let p2 = ProcessId {
+            pid: 8000,
+            start: 300,
+        };
+        let p3 = ProcessId {
+            pid: 9000,
+            start: 400,
+        };
+        *t.fake.alive.lock().unwrap() = vec![P1, p2, p3];
+        t.hook(0, "live", "UserPromptSubmit", "", Some(P1));
+        t.hook(0, "exited", "UserPromptSubmit", "", Some(p2));
+        t.hook(0, "reused", "UserPromptSubmit", "", Some(p3));
+        t.hook(0, "noproc", "UserPromptSubmit", "", None);
+        // While Knock is closed: p2 exits, p3's PID is reused by another
+        // process, and the PID with no recorded process is irrelevant.
+        *t.fake.alive.lock().unwrap() = vec![
+            P1,
+            ProcessId {
+                pid: p3.pid,
+                start: 999,
+            },
+        ];
+        t.restart(1000);
+        let states: Vec<_> = (t.views().iter())
+            .map(|v| (v.id.clone(), v.state))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("live".to_string(), "working"),
+                ("exited".to_string(), "ended_unexpectedly"),
+                ("reused".to_string(), "ended_unexpectedly"),
+                ("noproc".to_string(), "working"),
+            ]
+        );
+        // Only the live one can be jumped to.
+        let p = read(&t.shared);
+        assert_eq!(p.jump.keys().collect::<Vec<_>>(), ["live"]);
+        drop(p);
+        // The ended ones fade 60 s after the restart (item 3).
+        t.core.tick(T0 + 1000 + 59_999, NOON);
+        assert_eq!(t.views().len(), 4);
+        t.core.tick(T0 + 61_000, NOON);
+        let left: Vec<_> = t.views().iter().map(|v| v.id.clone()).collect();
+        assert_eq!(left, ["live", "noproc"]);
+        // The per-tick liveness check keeps watching the restored process:
+        // once it goes, the session ends as for a new one (§9.7).
+        *t.fake.alive.lock().unwrap() = vec![];
+        t.core.tick(T0 + 62_000, NOON);
+        assert_eq!(t.views()[0].state, "ended_unexpectedly");
+        assert!(read(&t.shared).jump.is_empty());
+        // The one with no recorded process still follows the 6-hour rule.
+        t.core.tick(T0 + 6 * 60 * MIN, NOON);
+        assert!(t.views().is_empty(), "ADR 0018 item 7");
+    }
+
+    /// §6 Reliability through the whole shell: a Needs-you session restored
+    /// from the file is not turned into a calm "ready" by the main agent's
+    /// Stop, because the agent that was waiting is not recorded (no agent
+    /// ids are saved). Found by the fresh review of f6881dc.
+    #[test]
+    fn a_restored_knock_is_not_lost_when_the_turn_ends() {
+        let mut t = core("restore-knock-kept");
+        *t.fake.alive.lock().unwrap() = vec![P1];
+        // A sub-agent asks; the session is Needs you.
+        let sub = r#","agent_id":"sub","tool_name":"Write""#;
+        t.hook(0, "a", "PermissionRequest", sub, Some(P1));
+        assert_eq!(t.views()[0].state, "needs_input");
+        t.restart(1000);
+        assert_eq!(t.views()[0].state, "needs_input");
+        // The main agent finishes its turn: the knock stays, nothing is
+        // batched as Ready, and the tray still counts it.
+        let outs = t.hook(2000, "a", "Stop", "", Some(P1));
+        assert_eq!(t.views()[0].state, "needs_input", "a missed knock");
+        assert!(t.core.ready.is_empty(), "FR-8: not Ready yet");
+        assert!(toasts(&outs).is_empty(), "no second knock either");
+        assert_eq!(t.views()[0].tier, "needs_you");
+        // Answering it produces activity, which closes it to Ready.
+        t.hook(
+            3000,
+            "a",
+            "PostToolUse",
+            r#","tool_name":"Write""#,
+            Some(P1),
+        );
+        assert_eq!(t.views()[0].state, "ready");
+        assert_eq!(t.core.ready, ["a"]);
+    }
+
+    /// Item 4 through the shell: a session found gone keeps the 6-hour clock
+    /// of its saved last event, so repeated restarts never keep a stale
+    /// character alive. Found by the fresh review of f6881dc.
+    #[test]
+    fn restarting_does_not_give_a_stale_session_another_six_hours() {
+        let mut t = core("restore-stale");
+        t.hook(0, "a", "StopFailure", r#","error":"rate_limit""#, Some(P1));
+        assert_eq!(t.views()[0].state, "failed");
+        // Its terminal is closed, and Knock is restarted five hours later.
+        *t.fake.alive.lock().unwrap() = vec![];
+        t.restart(5 * 60 * MIN);
+        assert_eq!(t.views()[0].state, "failed", "ADR 0037 item 3");
+        // One hour after that, six hours after the last event, it goes.
+        t.core.tick(T0 + 6 * 60 * MIN - 1, NOON);
+        assert_eq!(t.views().len(), 1);
+        t.core.tick(T0 + 6 * 60 * MIN, NOON);
+        assert!(t.views().is_empty(), "not six hours from the restart");
+    }
+
+    /// Item 7: nothing is restored, nothing panics, and the file is left
+    /// alone until the next save replaces it.
+    #[test]
+    fn a_file_that_cant_be_understood_starts_with_no_sessions() {
+        let good = {
+            let mut t = core("restore-good");
+            *t.fake.alive.lock().unwrap() = vec![P1];
+            t.hook(0, "a", "PermissionRequest", ASK_WRITE, Some(P1));
+            t.core.flush();
+            std::fs::read_to_string(t.dir.join(SNAPSHOT)).unwrap()
+        };
+        // A sanity check first: the good file does restore.
+        let t = core("restore-ok");
+        std::fs::write(t.dir.join(SNAPSHOT), &good).unwrap();
+        drop(t);
+        let mut ok = core("restore-ok");
+        std::fs::write(ok.dir.join(SNAPSHOT), &good).unwrap();
+        ok.restart(1000);
+        assert_eq!(ok.views().len(), 1);
+
+        let v: Value = serde_json::from_str(&good).unwrap();
+        let mut version2 = v.clone();
+        version2["version"] = json!(2);
+        let mut unknown_state = v.clone();
+        unknown_state["sessions"][0]["state"] = json!("knocking");
+        let mut no_needs = v.clone();
+        no_needs["sessions"][0]["needs"] = Value::Null;
+        let mut unused = v.clone();
+        unused["sessions"][0]["state"] = json!("blocked_fixable");
+        unused["sessions"][0]["needs"] = Value::Null;
+        let mut bad_id = v.clone();
+        bad_id["sessions"][0]["id"] = json!("not a session id");
+        for (name, text) in [
+            ("empty", String::new()),
+            ("not json", "nonsense".into()),
+            ("truncated", good[..good.len() / 2].to_string()),
+            ("an array", "[]".into()),
+            ("version 2", version2.to_string()),
+            ("no version", json!({ "sessions": [] }).to_string()),
+            ("unknown state", unknown_state.to_string()),
+            ("needs_input without needs", no_needs.to_string()),
+            ("a state unused in v1", unused.to_string()),
+            ("a bad session id", bad_id.to_string()),
+        ] {
+            let mut t = core("restore-bad");
+            std::fs::write(t.dir.join(SNAPSHOT), &text).unwrap();
+            t.restart(1000);
+            assert!(t.views().is_empty(), "{name}: {:?}", t.views());
+            // The file is neither renamed nor deleted.
+            let still = std::fs::read_to_string(t.dir.join(SNAPSHOT)).unwrap();
+            assert_eq!(still, text, "{name}");
+            assert_eq!(std::fs::read_dir(&t.dir).unwrap().count(), 2, "{name}");
+            // The next save replaces it.
+            t.hook(2000, "new", "Stop", "", None);
+            t.core.flush();
+            let after = std::fs::read_to_string(t.dir.join(SNAPSHOT)).unwrap();
+            assert!(after.contains("new"), "{name}");
+        }
+        // A missing file is the normal first start.
+        let mut t = core("restore-missing");
+        t.restart(1000);
+        assert!(t.views().is_empty());
+    }
+
+    /// Item 7: the problem is logged by kind only (§11.5).
+    #[test]
+    fn a_snapshot_problem_is_logged_without_the_body_or_a_path() {
+        // A folder of its own: `core` uses the same name for its data dir.
+        let logs = temp_dir("restore-log-files");
+        let mut t = core("restore-log");
+        std::fs::write(
+            t.dir.join(SNAPSHOT),
+            r#"{"version":9,"sessions":[{"id":"s3cret"}]}"#,
+        )
+        .unwrap();
+        let sub = crate::log::FileLog::new(logs.clone());
+        tracing::subscriber::with_default(sub, || t.restart(1000));
+        let text: String = std::fs::read_dir(&logs)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "log"))
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect();
+        assert!(text.contains("saved sessions not restored"), "{text}");
+        assert!(text.contains("problem=Version"), "{text}");
+        assert!(text.contains(r#"file="sessions.json""#), "{text}");
+        for bad in ["s3cret", "version", t.dir.to_str().unwrap(), "knock-pipe"] {
+            assert!(!text.contains(bad), "{bad} in {text}");
+        }
+        let _ = std::fs::remove_dir_all(&logs);
+    }
+
+    /// A file the released version wrote (no `turnDone`) restores with safe
+    /// defaults: the episode closes to `working`, never to `ready`.
+    #[test]
+    fn an_old_format_file_without_the_new_fields_restores() {
+        let mut t = core("restore-old");
+        *t.fake.alive.lock().unwrap() = vec![P1];
+        t.hook(0, "a", "PermissionRequest", ASK_WRITE, Some(P1));
+        t.core.flush();
+        let text = std::fs::read_to_string(t.dir.join(SNAPSHOT)).unwrap();
+        let mut v: Value = serde_json::from_str(&text).unwrap();
+        let entry = v["sessions"][0].as_object_mut().unwrap();
+        assert!(entry.remove("turnDone").is_some(), "the new field");
+        std::fs::write(t.dir.join(SNAPSHOT), v.to_string()).unwrap();
+        t.restart(1000);
+        assert_eq!(t.views()[0].state, "needs_input");
+        // Item 5: any agent's activity closes it, here to working.
+        t.hook(2000, "a", "PreToolUse", r#","tool_name":"Read""#, Some(P1));
+        assert_eq!(t.views()[0].state, "working");
+    }
+
+    /// A restored session is not in an away summary merely because it was
+    /// restored (FR-9, ADR 0034).
+    #[test]
+    fn a_restored_session_alone_is_not_in_an_away_summary() {
+        let mut t = core("restore-away");
+        *t.fake.alive.lock().unwrap() = vec![P1];
+        t.hook(0, "a", "PermissionRequest", ASK_WRITE, Some(P1));
+        t.hook(0, "b", "Stop", "", Some(P1));
+        // Knock starts again much later; the user has been idle all along.
+        t.restart(60 * MIN);
+        let r = 60 * MIN;
+        assert!(aways(&t.idle_tick(r + 1000, r - 30 * MIN)).is_empty());
+        // Returning sends nothing: both states were entered before the
+        // idle period began.
+        let got = aways(&t.idle_tick(r + 2000, r + 1500));
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]

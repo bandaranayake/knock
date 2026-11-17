@@ -1,6 +1,6 @@
 //! Normalized event, version 1 (SPEC.md §8.3). Serializes to the §8.3 shape.
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,7 +83,8 @@ pub struct Context {
     pub agent_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Also read back from the saved snapshot (FR-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Read,

@@ -42,7 +42,8 @@ pub struct Win {
 }
 
 /// §9.5 jump precision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+/// Also read back from the saved snapshot (FR-13, `crate::snapshot`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Precision {
     ExactWindow,

@@ -69,6 +69,48 @@ async function shot(page: Page, name: string) {
 	await expect(page).toHaveScreenshot(`${name}.png`, { fullPage: true });
 }
 
+/** One part of a screen, for something that sits below the fold. */
+async function shotOf(page: Page, name: string, selector: string) {
+	await expectContrast(page);
+	await expect(page.locator(selector)).toHaveScreenshot(`${name}.png`);
+}
+
+/**
+ * A clipboard that records what it was given, or refuses the way Windows can
+ * (ADR 0038). Call before `open`.
+ */
+const clipboard = (page: Page, mode: "ok" | "refuse") =>
+	page.addInitScript((m) => {
+		const copied: string[] = [];
+		(globalThis as unknown as { __copied: string[] }).__copied = copied;
+		Object.defineProperty(navigator, "clipboard", {
+			configurable: true,
+			value: {
+				writeText: async (text: string) => {
+					if (m === "refuse") throw new Error("NotAllowedError");
+					copied.push(text);
+				},
+			},
+		});
+	}, mode);
+
+const copied = (page: Page) =>
+	page.evaluate(
+		() => (globalThis as unknown as { __copied: string[] }).__copied,
+	);
+
+/** What `get_diagnostics()` answers, straight from the mocked core. */
+const diagnostics = (page: Page) =>
+	page.evaluate(
+		() =>
+			globalThis.__TAURI__?.core.invoke("get_diagnostics") as Promise<{
+				version: string;
+				text: string;
+			}>,
+	);
+
+const report = (page: Page) => page.locator(".report");
+
 // The way to each screen from the start of the flow, with two displays.
 const TO_SIGNIN = ["Start", "Next", "Confirm and connect", "Next"];
 const TO_TEST = [...TO_SIGNIN, "Yes, start with Windows"];
@@ -184,6 +226,38 @@ for (const theme of THEMES) {
 			page.getByText("Knock isn't connected, so it can't see"),
 		).toBeVisible();
 		await shot(page, `settings-removed-${theme}`);
+	});
+
+	// Report a problem: the version line and Copy diagnostics (ADR 0038).
+	test(`settings: report a problem, ${theme}`, async ({ page }) => {
+		await open(page, "installed=1", theme);
+		await expect(page.locator(".checks li")).toHaveCount(3);
+		await expect(report(page).locator(".version")).toHaveText(
+			"Knock 0.3.0-beta.1",
+		);
+		await shotOf(page, `settings-report-${theme}`, ".report");
+	});
+
+	test(`settings: copied confirmation, ${theme}`, async ({ page }) => {
+		await clipboard(page, "ok");
+		await open(page, "installed=1", theme);
+		await expect(page.locator(".checks li")).toHaveCount(3);
+		await click(page, "Copy diagnostics");
+		await expect(report(page).locator("[role=status]")).toHaveText(
+			"Copied. Paste it into your bug report.",
+		);
+		await shotOf(page, `settings-report-copied-${theme}`, ".report");
+	});
+
+	test(`settings: a refused clipboard, ${theme}`, async ({ page }) => {
+		await clipboard(page, "refuse");
+		await open(page, "installed=1", theme);
+		await expect(page.locator(".checks li")).toHaveCount(3);
+		await click(page, "Copy diagnostics");
+		await expect(report(page).getByRole("alert")).toContainText(
+			"Windows didn't let Knock use the clipboard",
+		);
+		await shotOf(page, `settings-report-refused-${theme}`, ".report");
 	});
 
 	test(`settings: errors, ${theme}`, async ({ page }) => {
@@ -501,6 +575,61 @@ test("Settings: no banner and no Repair while Knock is listening", async ({
 	await open(page, "installed=1");
 	await expect(page.locator(".checks li")).toHaveCount(3);
 	await expect(page.getByRole("button", { name: "Repair" })).toHaveCount(0);
+});
+
+test("Settings: Copy diagnostics copies the core's text, exactly as the core wrote it", async ({
+	page,
+}) => {
+	await clipboard(page, "ok");
+	await open(page, "installed=1");
+	const diag = await diagnostics(page);
+	expect(diag.text).toContain("Knock 0.3.0-beta.1");
+	expect(await copied(page)).toEqual([]);
+	await click(page, "Copy diagnostics");
+	// The core's text, unchanged: nothing added, nothing removed.
+	expect(await copied(page)).toEqual([diag.text]);
+	await expect(report(page).locator("[role=status]")).toHaveText(
+		"Copied. Paste it into your bug report.",
+	);
+	await expect(report(page).getByRole("alert")).toHaveCount(0);
+	// Reachable and usable by keyboard alone.
+	const button = page.getByRole("button", { name: "Copy diagnostics" });
+	await button.focus();
+	await page.keyboard.press("Enter");
+	expect(await copied(page)).toEqual([diag.text, diag.text]);
+});
+
+test("Settings: no version line and no placeholder when diagnostics fail", async ({
+	page,
+}) => {
+	await open(page, "installed=1&diag=fail");
+	await expect(page.locator(".checks li")).toHaveCount(3);
+	await expect(
+		page.getByRole("heading", { level: 3, name: "Report a problem" }),
+	).toBeVisible();
+	await expect(report(page).locator(".version")).toHaveCount(0);
+	await expect(report(page).getByRole("alert")).toHaveCount(0);
+	await expect(report(page).locator("[role=status]")).toHaveText("");
+	// Pressing it anyway explains the problem; it never fails silently.
+	await click(page, "Copy diagnostics");
+	await expect(report(page).getByRole("alert")).toHaveText(
+		"Knock couldn't gather the details just now. Please try again.",
+	);
+	await expect(page.getByLabel("Diagnostics to copy")).toHaveCount(0);
+});
+
+test("Settings: a refused clipboard leaves the details selectable", async ({
+	page,
+}) => {
+	await clipboard(page, "refuse");
+	await open(page, "installed=1");
+	const diag = await diagnostics(page);
+	await click(page, "Copy diagnostics");
+	await expect(report(page).getByRole("alert")).toHaveText(
+		"Windows didn't let Knock use the clipboard. The details are below: select them and press Ctrl+C to copy them yourself.",
+	);
+	await expect(page.getByLabel("Diagnostics to copy")).toHaveValue(diag.text);
+	await expect(report(page).locator("[role=status]")).toHaveText("");
 });
 
 const taskbar = (page: Page) =>

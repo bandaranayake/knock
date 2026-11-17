@@ -16,6 +16,7 @@
 //   save=fail               update_settings rejects every change
 //   knock=fail              play_test_knock rejects
 //   empty=1                 the settings file doesn't exist yet, so there is no backup
+//   diag=fail               get_diagnostics rejects, so Settings shows no version
 // Every call is logged under the page and kept in `window.__calls`.
 import type { Settings } from "../../overlay/bridge";
 import type { Check, Monitor } from "../core";
@@ -156,6 +157,37 @@ const checks = (): Check[] => [
 	},
 ];
 
+// Diagnostics (§8.5, ADR 0038): the core builds this text, so the mock does too. It holds
+// no agent content, no token, no port, no session id, no project name, no name and no path.
+const VERSION = "0.3.0-beta.1";
+const onOff = (b: boolean) => (b ? "on" : "off");
+const scaling = (m: Monitor) => (m.width >= 2560 ? "150%" : "100%");
+const diagnosticsText = () =>
+	[
+		`Knock ${VERSION}`,
+		"Windows 11 Pro 24H2 (build 26200.1742)",
+		"",
+		"Checks",
+		...checks().map(
+			(c) => `  ${c.label}: ${c.ok ? "pass" : "fail"} - ${c.detail}`,
+		),
+		"",
+		"Sessions",
+		"  needs you 1, working 2, idle 0, done 1",
+		"  project known exactly 3, guessed 1, unknown 0",
+		"",
+		"Settings",
+		`  show as ${settings.mode}, size ${settings.size}, taskbar ${
+			settings.monitor === "primary" ? "main display" : "a chosen display"
+		}`,
+		`  stuck after ${settings.stallMinutes} min, remind after ${settings.escalationMinutes} min, notify when stuck ${onOff(settings.notifyOnStall)}`,
+		`  notifications paused ${onOff(settings.pauseNotifications)}, quiet hours ${onOff(settings.quietHours.enabled)}, start at sign-in ${onOff(settings.launchAtSignIn === true)}`,
+		"",
+		`Displays ${monitors.length}`,
+		...monitors.map((m) => `  ${m.width} x ${m.height} at ${scaling(m)}`),
+		"",
+	].join("\n");
+
 const handlers = new Map<string, ((e: { payload: unknown }) => void)[]>();
 const emit = (event: string, payload: unknown) => {
 	for (const h of handlers.get(event) ?? []) h({ payload });
@@ -230,6 +262,11 @@ const commands: Record<string, (args: Record<string, unknown>) => unknown> = {
 		return { ok: true, backup: BACKUP };
 	},
 	run_health_check: () => checks(),
+	get_diagnostics: () => {
+		if (q.get("diag") === "fail")
+			throw "Knock couldn't gather the details just now.";
+		return { version: VERSION, text: diagnosticsText() };
+	},
 	play_test_knock: () => {
 		if (q.get("knock") === "fail") throw "The strip isn't showing.";
 	},
