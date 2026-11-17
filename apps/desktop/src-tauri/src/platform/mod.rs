@@ -38,6 +38,33 @@ pub fn monitor_id(device_path: &str) -> String {
     knock_core::project_key(device_path)
 }
 
+/// The Windows version, for Copy diagnostics (ADR 0038). Plain strings: no
+/// path, no user name, nothing else about the machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OsVersion {
+    /// "Windows 11" or "Windows 10" ([`windows_name`]).
+    pub name: &'static str,
+    /// The version Windows shows in its own Settings, like "25H2". Empty
+    /// when Windows doesn't say.
+    pub version: String,
+    /// The build, with the update revision when Windows gives one:
+    /// "26200.1742", else "26200".
+    pub build: String,
+}
+
+/// Which Windows a build number belongs to. Not from `ProductName`, which
+/// still says "Windows 10" on Windows 11, nor from `GetVersionEx`, which
+/// reports an older version unless the app's manifest says otherwise.
+/// Windows 11 starts at build 22000. A build newer than anything known
+/// still reads "Windows 11"; the build number on the same line keeps the
+/// line unambiguous.
+pub fn windows_name(build: u32) -> &'static str {
+    match build >= 22000 {
+        true => "Windows 11",
+        false => "Windows 10",
+    }
+}
+
 /// One display's geometry, for placing the strip (§9.2).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Display {
@@ -99,6 +126,9 @@ pub trait Platform: Send + Sync {
     /// §9.7 idle time: ms since the user last used the mouse, keyboard or
     /// touch anywhere in this Windows session, or `None` if it can't be read.
     fn idle_ms(&self) -> Option<u64>;
+    /// The Windows version for Copy diagnostics (ADR 0038), or `None` when
+    /// Windows doesn't say.
+    fn windows_version(&self) -> Option<OsVersion>;
 }
 
 /// §9.7 idle time from the system tick count now (`GetTickCount64`) and the
@@ -315,6 +345,13 @@ impl Platform for FakePlatform {
     }
     fn idle_ms(&self) -> Option<u64> {
         *self.idle.lock().unwrap()
+    }
+    fn windows_version(&self) -> Option<OsVersion> {
+        Some(OsVersion {
+            name: windows_name(26_200),
+            version: "25H2".into(),
+            build: "26200.1742".into(),
+        })
     }
 }
 
@@ -545,6 +582,20 @@ mod tests {
             idle_from_ticks(2 * wrap + 10 * min, (wrap - min) as u32),
             11 * min
         );
+    }
+
+    /// ADR 0038: the name follows the build number, since the registry's
+    /// `ProductName` says "Windows 10" on Windows 11 too.
+    #[test]
+    fn the_windows_name_follows_the_build_number() {
+        assert_eq!(windows_name(26_200), "Windows 11", "25H2");
+        assert_eq!(windows_name(22_631), "Windows 11", "23H2");
+        assert_eq!(windows_name(22_000), "Windows 11", "the first 11 build");
+        assert_eq!(windows_name(21_996), "Windows 10", "a late 10 build");
+        assert_eq!(windows_name(19_045), "Windows 10", "22H2");
+        assert_eq!(windows_name(0), "Windows 10");
+        // Newer than anything known: still 11, and the build says which.
+        assert_eq!(windows_name(30_000), "Windows 11");
     }
 
     #[test]

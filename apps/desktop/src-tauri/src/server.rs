@@ -55,7 +55,8 @@ impl ServerConfig {
 /// Loads `server.json` from `dir` and binds its port. On first run (no file)
 /// picks a free port and a new token, then saves them; after that the port is
 /// fixed. A port that can't be bound later is an error; Repair ([`repair`])
-/// picks a new one (ADR 0023).
+/// picks a new one (ADR 0023). Every error's kind says which step failed, so
+/// [`start_failed`] can say something true about it.
 pub fn listen(dir: &Path) -> io::Result<(ServerConfig, TcpListener)> {
     match std::fs::read(dir.join("server.json")) {
         Ok(bytes) => {
@@ -68,7 +69,14 @@ pub fn listen(dir: &Path) -> io::Result<(ServerConfig, TcpListener)> {
             save(dir, &cfg)?;
             Ok((cfg, listener))
         }
-        Err(e) => Err(e),
+        // A file that is there but can't be read. To the user that is the
+        // same as one that isn't valid, and Repair fixes both, so it gets
+        // the same kind. The kind it had is kept in the message, which holds
+        // a file name only (§11.5).
+        Err(e) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("server.json could not be read: {}", e.kind()),
+        )),
     }
 }
 
@@ -125,6 +133,35 @@ pub fn repair_failed(e: &io::Error) -> &'static str {
             "Knock couldn't find a free connection to listen on. Please restart your computer, then try Repair again."
         }
         _ => "Knock couldn't set up a new connection, so nothing changed. Please try Repair again.",
+    }
+}
+
+/// `setup_status.serverError` text for a [`listen`] error (ADR 0023, §6
+/// plain language). Repair is the right action for all of them, but they
+/// have quite different causes, so each says something true:
+///
+/// - the saved port is taken, or Windows won't let Knock use it
+///   (`AddrInUse`, `PermissionDenied`, `AddrNotAvailable`), and on a first
+///   run `AddrInUse` also means no free port was found in 50 tries: another
+///   program may hold it, which is what Hyper-V, WSL2 and Docker do;
+/// - `server.json` is there but can't be used (`InvalidData`: not valid, or
+///   not readable), where nothing is using anything: Knock simply can't tell
+///   which connection is its own;
+/// - anything else: a file that couldn't be written, or the random source
+///   failing, so no cause is claimed.
+pub fn start_failed(e: &io::Error) -> &'static str {
+    match e.kind() {
+        io::ErrorKind::AddrInUse
+        | io::ErrorKind::PermissionDenied
+        | io::ErrorKind::AddrNotAvailable => {
+            "Knock couldn't start listening for Claude Code. Another program may be using its connection. Choose Repair to give Knock a new one."
+        }
+        io::ErrorKind::InvalidData => {
+            "Knock couldn't use its own connection file (server.json), so it couldn't start listening for Claude Code. Choose Repair to make a new connection."
+        }
+        _ => {
+            "Knock couldn't start listening for Claude Code, so it can't hear from your sessions. Choose Repair to set up a new connection."
+        }
     }
 }
 
@@ -991,6 +1028,65 @@ mod tests {
             let (next, _l) = repair(&dir, |_, l| Ok(l)).unwrap();
             assert_ne!(next.port, fixed.port);
             assert_eq!(next.token, first.token);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every reason [`listen`] can fail, with the text the user reads for
+    /// it. The old single text claimed another program was using Knock's
+    /// connection, which isn't true for an invalid `server.json` (deferred
+    /// finding 5 of the 2026-11-06 review).
+    #[test]
+    fn the_server_error_says_something_true_for_each_cause() {
+        let busy = "Knock couldn't start listening for Claude Code. Another program may be using its connection. Choose Repair to give Knock a new one.";
+        let invalid = "Knock couldn't use its own connection file (server.json), so it couldn't start listening for Claude Code. Choose Repair to make a new connection.";
+        let other = "Knock couldn't start listening for Claude Code, so it can't hear from your sessions. Choose Repair to set up a new connection.";
+        let dir = temp_dir("start-failed");
+        let file = dir.join("server.json");
+        // The saved port is held by another program.
+        let (cfg, blocker) = listen(&dir).unwrap();
+        let e = listen(&dir).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AddrInUse, "{e:?}");
+        assert_eq!(start_failed(&e), busy);
+        drop(blocker);
+        // No free port left on a first run: the same cause, the same text.
+        assert_eq!(start_failed(&no_free_port()), busy);
+        // Windows refuses the port (an excluded range, for example).
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(start_failed(&denied), busy);
+        assert_eq!(
+            start_failed(&io::Error::from(io::ErrorKind::AddrNotAvailable)),
+            busy
+        );
+        // `server.json` is there but not valid: nothing is using anything.
+        for bad in [
+            b"not json".to_vec(),
+            br#"{"port":80,"token":"x"}"#.to_vec(),
+            serde_json::to_vec(&ServerConfig {
+                port: cfg.port,
+                token: "short".into(),
+            })
+            .unwrap(),
+        ] {
+            std::fs::write(&file, &bad).unwrap();
+            let e = listen(&dir).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e:?}");
+            assert_eq!(start_failed(&e), invalid);
+        }
+        // `server.json` can't be read at all (here: it is a folder). The
+        // user can't act on the difference, and Repair fixes both.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let e = listen(&dir).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e:?}");
+        assert_eq!(start_failed(&e), invalid, "{e:?}");
+        assert!(e.to_string().starts_with("server.json could not be read"));
+        // Saving a first run's file, or the random source, failing.
+        assert_eq!(start_failed(&io::Error::other("no random bytes")), other);
+        // No path, no token and no port in any of them (§11.5).
+        for m in [busy, invalid, other] {
+            assert!(!m.contains('\\') && !m.contains('/'), "{m}");
+            assert!(!m.contains(&cfg.port.to_string()) && !m.contains(&cfg.token));
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
