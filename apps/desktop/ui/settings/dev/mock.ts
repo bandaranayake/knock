@@ -122,38 +122,33 @@ const before = () =>
 		: text(installed ? withHooks(hookPort) : userFile);
 const BACKUP = String.raw`C:\Users\Sam\AppData\Roaming\Knock\backups\settings.20261101-142530.json`;
 
+// Health checks (§8.5, FR-12): the core's `health()` gives each check a fixed label that
+// never changes with the result — pass or fail rides in `ok`, which the page draws as ✓ or
+// ✗ — so the mock uses the same three ids and labels, and details worded as the core words
+// them for the same situation. No path (but the file name), no token, no port, no project.
 const checks = (): Check[] => [
-	installed
-		? {
-				id: "hooks",
-				label: "Knock is connected to Claude Code",
-				ok: true,
-				detail: "Claude Code's settings file has all of Knock's entries.",
-			}
-		: {
-				id: "hooks",
-				label: "Knock isn't connected to Claude Code",
-				ok: false,
-				detail: "Run setup to connect it.",
-			},
-	serverError === null
-		? {
-				id: "server",
-				label: "Knock is listening for Claude Code",
-				ok: true,
-				detail: "Claude Code can reach Knock on this PC.",
-			}
-		: {
-				id: "server",
-				label: "Knock can't listen for Claude Code",
-				ok: false,
-				detail: "Use Repair to pick a new connection.",
-			},
 	{
-		id: "last",
-		label: "Last heard from a session",
+		id: "hooks",
+		label: "Connected to Claude Code",
+		ok: installed,
+		detail: installed
+			? "Knock is in your Claude Code settings (settings.json)."
+			: "Knock isn't in your Claude Code settings (settings.json), or its entry is out of date. Run setup to connect it.",
+	},
+	{
+		id: "server",
+		label: "Listening for Claude Code",
+		ok: serverError === null,
+		detail:
+			serverError === null
+				? "Knock is listening for Claude Code, on this computer only."
+				: "Knock isn't listening for Claude Code. Choose Repair to fix it.",
+	},
+	{
+		id: "lastEvent",
+		label: "Last event from Claude Code",
 		ok: true,
-		detail: "2 minutes ago",
+		detail: "Knock last heard from Claude Code 2 minutes ago.",
 	},
 ];
 

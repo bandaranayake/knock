@@ -559,7 +559,9 @@ for (const where of ["banner", "health check"] as const)
 			"Another program on this PC took the connection Knock uses to hear from Claude Code.",
 		);
 		const row = page.locator(".checks .bad");
-		await expect(row).toContainText("Use Repair to pick a new connection.");
+		await expect(row).toContainText(
+			"Knock isn't listening for Claude Code. Choose Repair to fix it.",
+		);
 		await (where === "banner" ? banner : row)
 			.getByRole("button", { name: "Repair", exact: true })
 			.click();
