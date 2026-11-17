@@ -157,34 +157,48 @@ const checks = (): Check[] => [
 	},
 ];
 
-// Diagnostics (§8.5, ADR 0038): the core builds this text, so the mock does too. It holds
-// no agent content, no token, no port, no session id, no project name, no name and no path.
+// Diagnostics (§8.5, ADR 0038): the core builds this text, so the mock does too, in the
+// same sections, labels and words as `diagnostics::text` in the core. It holds no agent
+// content, no token, no port, no session id, no project name, no name, no path, no display
+// geometry and no monitor id.
 const VERSION = "0.3.0-beta.1";
 const onOff = (b: boolean) => (b ? "on" : "off");
+// `launchAtSignIn` is three-valued: null until setup asks (§8.6), and the core says which
+// of the three it is, because null is what still opens setup by itself (ADR 0039).
+const signIn = (setting: boolean | null) =>
+	setting === null ? "not chosen yet" : onOff(setting);
+// A display's scaling, as Windows shows it. The width only picks the mock's answer; it is
+// never printed, because ADR 0038 lists each display's scaling and nothing else.
 const scaling = (m: Monitor) => (m.width >= 2560 ? "150%" : "100%");
+// One pretend set of sessions, so the counts read like a busy machine's would.
+const TIERS = "needs you 1, working 2, done 1, resting 0";
+const JUMP = "exact window 3, app window 1, none 0";
 const diagnosticsText = () =>
 	[
 		`Knock ${VERSION}`,
-		"Windows 11 Pro 24H2 (build 26200.1742)",
+		"Windows 11, version 24H2 (build 26200.1742)",
 		"",
 		"Checks",
 		...checks().map(
 			(c) => `  ${c.label}: ${c.ok ? "pass" : "fail"} - ${c.detail}`,
 		),
 		"",
-		"Sessions",
-		"  needs you 1, working 2, idle 0, done 1",
-		"  project known exactly 3, guessed 1, unknown 0",
+		"Sessions 4",
+		`  ${TIERS}`,
+		`  jump target: ${JUMP}`,
 		"",
 		"Settings",
 		`  show as ${settings.mode}, size ${settings.size}, taskbar ${
 			settings.monitor === "primary" ? "main display" : "a chosen display"
 		}`,
 		`  stuck after ${settings.stallMinutes} min, remind after ${settings.escalationMinutes} min, notify when stuck ${onOff(settings.notifyOnStall)}`,
-		`  notifications paused ${onOff(settings.pauseNotifications)}, quiet hours ${onOff(settings.quietHours.enabled)}, start at sign-in ${onOff(settings.launchAtSignIn === true)}`,
+		`  notifications paused ${onOff(settings.pauseNotifications)}, quiet hours ${onOff(settings.quietHours.enabled)}, start at sign-in ${signIn(settings.launchAtSignIn)}`,
 		"",
 		`Displays ${monitors.length}`,
-		...monitors.map((m) => `  ${m.width} x ${m.height} at ${scaling(m)}`),
+		...monitors.map(
+			(m, i) =>
+				`  display ${i + 1}${m.primary ? " (main)" : ""}: ${scaling(m)}`,
+		),
 		"",
 	].join("\n");
 
