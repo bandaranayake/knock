@@ -303,6 +303,48 @@ button.link {
 	color: var(--muted);
 }
 
+/* Report a problem: the version and Copy diagnostics, under the health check. */
+.report {
+	border-top: 1px solid var(--line);
+	margin-top: 16px;
+	padding-top: 12px;
+}
+
+.report .version {
+	font-weight: 600;
+	margin: 0 0 8px;
+}
+
+.report .copied {
+	color: var(--ok);
+	font-weight: 600;
+	margin: 12px 0 0;
+}
+
+.report .copied:empty {
+	margin: 0;
+}
+
+.report .error {
+	margin: 12px 0 0;
+}
+
+textarea.diagnostics {
+	display: block;
+	width: 100%;
+	box-sizing: border-box;
+	margin-top: 8px;
+	padding: 8px;
+	border: 1px solid var(--line);
+	border-radius: 4px;
+	background: var(--card);
+	color: var(--text);
+	font:
+		12px / 1.45 Consolas,
+		monospace;
+	resize: vertical;
+}
+
 .sr-only {
 	position: absolute;
 	width: 1px;
