@@ -50,7 +50,7 @@ When a session needs you, its animal knocks. Click it to jump straight there.</p
 
 ## Install
 
-1. Download `Knock_0.3.0-beta.1_x64-setup.exe` from the [Releases page](https://github.com/bandaranayake/knock/releases).
+1. Download `Knock_0.9.0_x64-setup.exe` from the [Releases page](https://github.com/bandaranayake/knock/releases).
 2. Run it. It installs for your user only, with no administrator rights.
 3. Follow the short setup.
 
