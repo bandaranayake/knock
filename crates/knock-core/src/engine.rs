@@ -20,8 +20,17 @@
 //! a pid (§8.1), so they follow the no-process rule.
 //!
 //! A (state, input) pair with no §8.4 row leaves the session unchanged.
+//!
+//! Restore (FR-13, ADR 0037): [`Engine::restore`] puts back the sessions the
+//! app saved before a restart, with each recorded process re-checked by the
+//! app ([`Liveness`]). It emits no effects. A restored session's clocks
+//! (escalation, stall, the 60 s fade) count from the restore time, while its
+//! `since` and the 6-hour rule's last-event time stay as saved. A restored
+//! episode doesn't know who was waiting (no agent ids are saved), so it waits
+//! on one unknown requester: the first activity from an agent that isn't a
+//! known waiting requester, or the main agent's Stop, stands for it.
 
-use crate::adapter::project_key;
+use crate::adapter::{is_id, project_key};
 use crate::event::{Category, Event, Kind};
 use std::collections::HashMap;
 
@@ -162,6 +171,36 @@ impl State {
             Cancelled => "cancelled",
         }
     }
+
+    /// The state named `s` ([`State::as_str`]), if any.
+    pub fn parse(s: &str) -> Option<Self> {
+        use State::*;
+        [
+            NeedsInput,
+            Failed,
+            Stalled,
+            BlockedFixable,
+            Ready,
+            Working,
+            WaitingAgent,
+            Communicating,
+            Idle,
+            EndedUnexpectedly,
+            Paused,
+            Cancelled,
+        ]
+        .into_iter()
+        .find(|st| st.as_str() == s)
+    }
+
+    /// v1 has an event or timer that produces it (§8.4 table).
+    fn produced_in_v1(self) -> bool {
+        use State::*;
+        matches!(
+            self,
+            NeedsInput | Failed | Stalled | Ready | Working | Idle | EndedUnexpectedly
+        )
+    }
 }
 
 impl Tier {
@@ -192,15 +231,24 @@ pub struct Needs {
     pub seen: bool,
     pub opened: u64,
     pub escalated: bool,
-    /// The requesters still waiting (ADR 0019); never empty. Kept only for
-    /// the episode.
+    /// The requesters still waiting (ADR 0019). Kept only for the episode.
+    /// Never empty unless `unknown` is set.
     waiting: Vec<Option<String>>,
+    /// A requester from before a restart, whose agent isn't known, still
+    /// waits (ADR 0037 item 5).
+    unknown: bool,
 }
 
 impl Needs {
     /// The requesters still waiting: `None` is the main agent.
     pub fn waiting(&self) -> &[Option<String>] {
         &self.waiting
+    }
+
+    /// A requester from before a restart still waits; which agent it is
+    /// isn't known (ADR 0037 item 5).
+    pub fn unknown_requester(&self) -> bool {
+        self.unknown
     }
 }
 
@@ -230,9 +278,18 @@ pub struct Session {
     /// The main agent's turn completed and it hasn't asked or worked since
     /// (ADR 0021).
     turn_done: bool,
+    /// The escalation, stall and fade clocks count from no earlier than
+    /// this: the restore time for a restored session, else 0 (ADR 0037 item 4).
+    clock_from: u64,
 }
 
 impl Session {
+    /// The main agent's turn completed and it hasn't asked or worked since
+    /// (ADR 0021); saved so a restored episode can close to `ready`.
+    pub fn turn_done(&self) -> bool {
+        self.turn_done
+    }
+
     /// A session as its first event creates it (also used to restart an
     /// `ended_unexpectedly` one, ADR 0018).
     fn new(e: &Event, simulated: bool, animal: String) -> Self {
@@ -251,6 +308,7 @@ impl Session {
             process_known: e.context.pid.is_some(),
             requests: Vec::new(),
             turn_done: false,
+            clock_from: 0,
         }
     }
 
@@ -263,6 +321,109 @@ impl Session {
             self.needs = None;
         }
     }
+
+    /// §8.4 "Process gone without `session.ended`": `ended_unexpectedly`,
+    /// except that `failed` stays `failed`.
+    fn gone(&mut self, now: u64) {
+        self.gone_at.get_or_insert(now);
+        if self.state != State::Failed {
+            self.set(State::EndedUnexpectedly, now);
+        }
+    }
+
+    /// Removed by the next tick at `now`: faded 60 s after it ended, or no
+    /// events and no live process for 6 h (ADR 0018).
+    fn expired(&self, now: u64) -> bool {
+        let ended = now.saturating_sub(self.since.max(self.clock_from));
+        let faded = self.state == State::EndedUnexpectedly && ended >= FADE_MS;
+        // No live process: reported gone, or never known (ADR 0018).
+        let gone = self.gone_at.or((!self.process_known).then_some(0));
+        let quiet = gone.is_some_and(|g| now.saturating_sub(g.max(self.last_event)) >= REMOVE_MS);
+        faded || quiet
+    }
+}
+
+/// Whether a saved session's recorded process still runs, as the app
+/// re-checked it at start (§9.7: same PID and same start time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// No process was recorded (ADR 0018 item 7, ADR 0037 item 6).
+    Unknown,
+    Alive,
+    /// Not running, or its PID now belongs to another process.
+    Gone,
+}
+
+/// A saved `needs_input` episode (§11.4 data only: no requesters).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedNeeds {
+    pub kind: NeedsKind,
+    pub label: Option<String>,
+    pub seen: bool,
+    pub opened: u64,
+    pub escalated: bool,
+}
+
+/// One session as the app saved it and read it back (FR-13, ADR 0037).
+/// Holds no agent ids, no cwd and no free text (§11.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Saved {
+    pub id: String,
+    pub project: String,
+    pub project_key: String,
+    pub state: State,
+    pub since: u64,
+    pub last_event: u64,
+    pub activity: Option<Category>,
+    pub needs: Option<SavedNeeds>,
+    pub animal: String,
+    /// [`Session::turn_done`]; `false` when the file doesn't say.
+    pub turn_done: bool,
+    /// Never restored (§8.1, ADR 0037 item 1).
+    pub simulated: bool,
+    pub process: Liveness,
+}
+
+impl Saved {
+    /// What the app saves of `s`, with its re-checked `process`.
+    pub fn of(s: &Session, process: Liveness) -> Self {
+        Saved {
+            id: s.id.clone(),
+            project: s.project.clone(),
+            project_key: s.project_key.clone(),
+            state: s.state,
+            since: s.since,
+            last_event: s.last_event,
+            activity: s.activity,
+            needs: s.needs.as_ref().map(|n| SavedNeeds {
+                kind: n.kind,
+                label: n.label.clone(),
+                seen: n.seen,
+                opened: n.opened,
+                escalated: n.escalated,
+            }),
+            animal: s.animal.clone(),
+            turn_done: s.turn_done,
+            simulated: s.simulated,
+            process,
+        }
+    }
+}
+
+/// Why [`Engine::restore`] refused a snapshot. Kinds only, never content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreError {
+    /// The engine already has sessions: restore runs once, at start.
+    NotEmpty,
+    /// A session id the adapter would not accept (§8.3).
+    BadId,
+    DuplicateId,
+    /// A state marked "unused in v1" (§8.4).
+    UnusedState,
+    /// `needs_input` without its episode.
+    NeedsMissing,
+    /// An episode on a state other than `needs_input`.
+    NeedsUnexpected,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -300,10 +461,7 @@ impl Engine {
             Input::SetSuppressed(on) => self.suppressed = on,
             Input::ProcessGone { session_id, now } => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                    s.gone_at.get_or_insert(now);
-                    if s.state != State::Failed {
-                        s.set(State::EndedUnexpectedly, now);
-                    }
+                    s.gone(now);
                 }
             }
         }
@@ -311,6 +469,79 @@ impl Engine {
             fx.push(Effect::Persist);
         }
         fx
+    }
+
+    /// FR-13, ADR 0037: puts back the saved sessions at start, at time `now`,
+    /// in their saved order. Emits no effects (item 8) and starts with no
+    /// dedup memory. All or nothing: on an error no session is restored.
+    ///
+    /// - Simulated sessions are skipped (item 1).
+    /// - Each comes back in its saved state, with its animal and `since`; an
+    ///   episode keeps its kind, label, `seen` and `escalated` (item 2) and
+    ///   waits on one unknown requester (item 5).
+    /// - [`Liveness::Gone`] follows the "Process gone" row at `now`: the 60 s
+    ///   fade counts from the restart; `failed` stays `failed` (item 3).
+    /// - The escalation and stall clocks count from `now`; the 6-hour rule
+    ///   keeps the saved last-event time (item 4), so a session it already
+    ///   removes is not restored.
+    ///
+    /// Returns how many sessions were restored.
+    pub fn restore(&mut self, saved: Vec<Saved>, now: u64) -> Result<usize, RestoreError> {
+        if !self.sessions.is_empty() {
+            return Err(RestoreError::NotEmpty);
+        }
+        let saved: Vec<Saved> = saved.into_iter().filter(|s| !s.simulated).collect();
+        for (i, s) in saved.iter().enumerate() {
+            if !is_id(&s.id) {
+                return Err(RestoreError::BadId);
+            }
+            if saved[..i].iter().any(|o| o.id == s.id) {
+                return Err(RestoreError::DuplicateId);
+            }
+            if !s.state.produced_in_v1() {
+                return Err(RestoreError::UnusedState);
+            }
+            match (s.state == State::NeedsInput, s.needs.is_some()) {
+                (true, false) => return Err(RestoreError::NeedsMissing),
+                (false, true) => return Err(RestoreError::NeedsUnexpected),
+                _ => {}
+            }
+        }
+        for s in saved {
+            let mut session = Session {
+                id: s.id,
+                project: s.project,
+                project_key: s.project_key,
+                state: s.state,
+                since: s.since,
+                activity: s.activity,
+                needs: s.needs.map(|n| Needs {
+                    kind: n.kind,
+                    // As `open` sets it: a tool only for a permission.
+                    label: n.label.filter(|_| n.kind == NeedsKind::Permission),
+                    seen: n.seen,
+                    opened: n.opened,
+                    escalated: n.escalated,
+                    waiting: Vec::new(),
+                    unknown: true,
+                }),
+                animal: s.animal,
+                simulated: false,
+                last_event: s.last_event,
+                gone_at: None,
+                process_known: s.process != Liveness::Unknown,
+                requests: Vec::new(),
+                turn_done: s.turn_done,
+                clock_from: now,
+            };
+            if s.process == Liveness::Gone {
+                session.gone(now);
+            }
+            if !session.expired(now) {
+                self.sessions.push(session);
+            }
+        }
+        Ok(self.sessions.len())
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -402,15 +633,17 @@ impl Engine {
                 let who = &e.context.agent_id;
                 // The main agent asking again: its turn isn't done (ADR 0021).
                 s.turn_done &= dup || who.is_some();
-                // `Some(waiting)`: open a new episode that also waits on them.
+                // `Some((waiting, unknown))`: open a new episode that also
+                // waits on them.
                 let opens = match (from, &mut s.needs) {
                     _ if dup => None,
-                    (Working | Idle | Ready | Stalled | Failed, _) => Some(Vec::new()),
+                    (Working | Idle | Ready | Stalled | Failed, _) => Some((Vec::new(), false)),
                     // ADR 0018 item 1: a new request (never the
                     // `permission_prompt` Notification) after the user saw
-                    // the episode is a new one; the old requesters still wait.
+                    // the episode is a new one; the old requesters still
+                    // wait, an unknown one from before a restart included.
                     (NeedsInput, Some(n)) if n.seen && !is_prompt(&e) => {
-                        Some(std::mem::take(&mut n.waiting))
+                        Some((std::mem::take(&mut n.waiting), n.unknown))
                     }
                     // Otherwise the same episode; the requester is added.
                     (NeedsInput, Some(n)) => {
@@ -421,8 +654,8 @@ impl Engine {
                     }
                     _ => None,
                 };
-                if let Some(waiting) = opens {
-                    self.open(i, e, waiting, fx);
+                if let Some((waiting, unknown)) = opens {
+                    self.open(i, e, waiting, unknown, fx);
                 }
             }
             // The Stop removes the main agent only (ADR 0019).
@@ -468,7 +701,7 @@ impl Engine {
             }
             Kind::NeedsPermission | Kind::NeedsAnswer => {
                 dedup(&mut self.sessions[i], &e);
-                self.open(i, e, Vec::new(), fx);
+                self.open(i, e, Vec::new(), false, fx);
             }
             Kind::TurnCompleted => {
                 self.sessions[i].turn_done = true;
@@ -486,8 +719,15 @@ impl Engine {
     }
 
     /// New `needs_input` episode, with its one `Notify`, waiting on
-    /// `waiting` and the event's requester.
-    fn open(&mut self, i: usize, e: Event, mut waiting: Vec<Option<String>>, fx: &mut Vec<Effect>) {
+    /// `waiting`, the event's requester and, if `unknown`, an unknown one.
+    fn open(
+        &mut self,
+        i: usize,
+        e: Event,
+        mut waiting: Vec<Option<String>>,
+        unknown: bool,
+        fx: &mut Vec<Effect>,
+    ) {
         if !waiting.contains(&e.context.agent_id) {
             waiting.push(e.context.agent_id.clone());
         }
@@ -504,6 +744,7 @@ impl Engine {
             opened: e.ts,
             escalated: false,
             waiting,
+            unknown,
         });
         self.notify(fx, &e.session_id, reason);
     }
@@ -511,17 +752,12 @@ impl Engine {
     fn tick(&mut self, now: u64, fx: &mut Vec<Effect>) {
         let (stall, escalation) = (self.settings.stall_ms, self.settings.escalation_ms);
         let (suppressed, notify_stall) = (self.suppressed, self.settings.notify_on_stall);
-        self.sessions.retain(|s| {
-            let faded =
-                s.state == State::EndedUnexpectedly && now.saturating_sub(s.since) >= FADE_MS;
-            // No live process: reported gone, or never known (ADR 0018).
-            let gone = s.gone_at.or((!s.process_known).then_some(0));
-            let quiet = gone.is_some_and(|g| now.saturating_sub(g.max(s.last_event)) >= REMOVE_MS);
-            !faded && !quiet
-        });
+        self.sessions.retain(|s| !s.expired(now));
         for s in &mut self.sessions {
+            // ADR 0037 item 4: no clock counts time before a restore.
+            let from = s.clock_from;
             match s.state {
-                State::Working if now.saturating_sub(s.last_event) >= stall => {
+                State::Working if now.saturating_sub(s.last_event.max(from)) >= stall => {
                     s.set(State::Stalled, now);
                     if notify_stall && !suppressed {
                         fx.push(Effect::Notify {
@@ -532,7 +768,8 @@ impl Engine {
                 }
                 State::NeedsInput => {
                     let Some(n) = &mut s.needs else { continue };
-                    if !n.escalated && !n.seen && now.saturating_sub(n.opened) >= escalation {
+                    let open_for = now.saturating_sub(n.opened.max(from));
+                    if !n.escalated && !n.seen && open_for >= escalation {
                         // Suppressed means dropped, not deferred.
                         n.escalated = true;
                         if !suppressed {
@@ -569,11 +806,17 @@ fn dedup(s: &mut Session, e: &Event) -> bool {
 }
 
 /// Removes `who` from the open episode's requesters; returns how many are
-/// left (0 when no episode is open).
+/// left (0 when no episode is open). An agent that isn't a known waiting
+/// requester stands for the unknown one from before a restart, if any
+/// (ADR 0037 item 5).
 fn remove(s: &mut Session, who: &Option<String>) -> usize {
     s.needs.as_mut().map_or(0, |n| {
-        n.waiting.retain(|a| a != who);
-        n.waiting.len()
+        if n.waiting.contains(who) {
+            n.waiting.retain(|a| a != who);
+        } else {
+            n.unknown = false;
+        }
+        n.waiting.len() + usize::from(n.unknown)
     })
 }
 
