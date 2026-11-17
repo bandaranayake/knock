@@ -638,7 +638,7 @@ Every screen uses plain words, explains why, and offers Back. Setup opens by its
 | UI logic      | Store updates, clip choice per state, den grouping                                                          | Vitest                                         |
 | UI visuals    | Every state × mode (animals, plain) × taskbar (light, dark) × animation effects (on, off)                   | Playwright screenshots against a mocked bridge |
 | Art           | Parts, pivots, clips valid                                                                                  | `pnpm art:check`                               |
-| Smoke         | Install, launch, `knock sim`, read the debug snapshot                                                       | Windows CI runner                              |
+| Smoke         | Launch, `knock sim`, read the debug snapshot. CI builds the installer and checks it exists but does not install it; installing is the user's manual test (§12.2, ADR 0041) | Windows CI runner |
 
 ### 12.2 Manual testing (done by the user)
 
@@ -719,7 +719,6 @@ knock/
 | Workflow      | Trigger      | Does                                                                                                                                  |
 | ------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `ci.yml`      | Pull request | `pnpm check`, `pnpm art:check`, `cargo-deny`, `pnpm audit`, Windows build, smoke test. `pnpm test:visual` runs locally instead: the lead runs it before merging any UI or art change (ADR 0040) |
-| `nightly.yml` | Push to main | Same, plus an installer artifact                                                                                                      |
 | `release.yml` | Tag `v*` (until Phase 6: a manual run from `main` builds the installer into a draft pre-release, ADR 0036) | Build the NSIS installer, sign the update package with the updater key, upload installer plus `latest.json` to a draft GitHub Release |
 
 The installer is unsigned. The user publishes each release by hand.
