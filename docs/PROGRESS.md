@@ -48,8 +48,19 @@ Done:
 - Lead found: `pnpm test:visual` had 5 failing overlay screenshots (13-122 px, threshold 10), caused by an Edge update, not by any change: nothing in `overlay/` or `art/` had changed since the baselines of 2026-11-04 (1ff0a25). The lead opened the `icons` diff image and saw only anti-aliasing on edges. Brief 5.5 sent to `ui` to confirm each diff and regenerate only those five.
 - Lead found: `.github/workflows/ci.yml` runs only `pnpm check`, `cargo fetch --locked`, `cargo-deny` and `pnpm audit`. §13.4 also lists `pnpm test:visual`, `pnpm art:check`, a Windows build and a smoke test; none of them has ever run on GitHub.
   - **ADR 0040, approved by the user on 2026-11-17:** CI gains `art:check`, the Windows build and the smoke test. `pnpm test:visual` stays local, run by the lead before merging any UI or art change, with the anti-aliasing check before any baseline is regenerated. The threshold stays at 10. SPEC.md §13.4 amended.
+- Brief 5.2 (`core-windows`) done and committed (f6881dc): sessions are restored at start (FR-13), with each process re-checked by PID and start time. Lead review passed; `pnpm check` passes (141 desktop, 44 engine, 27 restore, 2 invariants, 139 Vitest). Scope clean. Fresh review running (§11 rule 4 and 5 are in play), so not merged yet.
+  - `knock-core` stays pure: `Engine::restore` takes plain `Saved` data and the restore time. The new `snapshot.rs` is the only reader of `sessions.json`; the liveness check is passed in as a closure, so no OS call lives there.
+  - Snapshot: `turnDone` added (default `false`), so a file the released version wrote still restores. `simulated` is read and refused although it is never written.
+  - Invariants now generate restore points: snapshot → restore → continue, with each process randomly alive, gone or unknown.
+  - Existing tests changed, all justified and verified by the lead: the ADR 0019 "an open episode always waits on at least one requester" assertion now counts the unknown requester, as the lead instructed; the requester model accepts the unknown one; `snapshot_holds_no_agent_id_cwd_or_free_text` extended to the new keys and to a restored `Core`.
+  - Clarifications (lead), from the agent's open questions:
+    - A restored episode in which the main agent made its own request after the restart keeps knocking when that agent's `Stop` arrives, because the pre-restart requester may have been a sub-agent. `turn.started`, `agent.failed` and `session.ended` still close it, so it can't stick.
+    - An unknown `activity` or `precision` string refuses the whole file, like any other entry Knock can't understand (item 7).
+    - No length or charset check on `project`, `projectKey` or `animal`: Knock is the only writer, and the overlay already falls back to the fox for an unknown animal id (Phase 3 decision, with a visual test).
+    - **To do in brief 5.4:** the health check's "last heard from Claude Code" is not restored, so after a restart it says Knock has heard nothing until the first hook arrives. FR-12 says the health check reports the last event time, so it should read the saved `lastEventMs`. This also feeds `GET /v1/health` and `knock doctor`.
 Next:
-- Review and merge briefs 5.2 and 5.5, then brief 5.4: the core side of `get_diagnostics()`, the ADR 0039 start-up rule, and the finding (5) messages.
+- Resolve the fresh review of brief 5.2, merge it with brief 5.5, then the user's manual test of restart recovery.
+- Brief 5.4: the core side of `get_diagnostics()`, the ADR 0039 start-up rule, the restored last-event time, and the finding (5) messages.
 - Brief 5.6 (`core-windows`, `.github/`): make `ci.yml` match the amended §13.4 (ADR 0040).
 - Then: an error-handling survey, the README privacy note for Copy diagnostics (ADR 0038), and the §12.2 manual matrix for v0.9.
 Dependencies added: none
