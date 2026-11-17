@@ -730,7 +730,7 @@ The installer is unsigned. The user publishes each release by hand.
 | v0.1        | 2            | User only                             |
 | v0.2        | 3            | User only                             |
 | v0.3-beta.N | 4            | Public, via a GitHub pre-release (ADR 0035) |
-| v0.9        | 5            | Same testers, via auto-update         |
+| v0.9        | 5            | Same testers, downloaded from a GitHub pre-release (ADR 0042) |
 | v1.0        | 6            | Public                                |
 
 Testers MUST be told the installer is unsigned, and asked to check whether Smart App Control is on (it blocks unsigned apps entirely).
