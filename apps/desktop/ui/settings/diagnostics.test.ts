@@ -10,14 +10,19 @@ import {
 } from "./diagnostics";
 
 // A reply the core could really send: several lines, blank lines and a trailing newline.
+// Shortened (the core also lists sessions and settings), but every line here is worded as
+// `diagnostics::text` in the core words it, down to the fixed check label and the
+// "<label>: pass|fail - <detail>" shape, so nobody reads this as wording the app shows.
 const TEXT = [
 	"Knock 0.3.0-beta.1",
-	"Windows 11 Pro 24H2 (build 26200.1742)",
+	"Windows 11 Pro, version 24H2 (build 26200.1742)",
 	"",
 	"Checks",
-	"  Knock is connected to Claude Code: pass",
+	"  Connected to Claude Code: pass - Knock is in your Claude Code settings (settings.json).",
 	"",
 	"Displays 2",
+	"  display 1 (main): 150%",
+	"  display 2: 100%",
 	"",
 ].join("\n");
 const INFO: Diagnostics = { version: "0.3.0-beta.1", text: TEXT };

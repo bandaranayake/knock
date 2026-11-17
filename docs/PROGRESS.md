@@ -96,9 +96,15 @@ Done:
 - Brief 5.4b done (141e1af): `repair()` carries the same `Step`, so pressing Repair with an unwritable `%APPDATA%\Knock` now says nothing changed, that trying again will not help until the cause is fixed, and what to do. The bind case still invites a retry, which is honest. The agent reported this residual itself rather than widening brief 5.4a's scope.
 - **`phase-5/diagnostics-core` merged into `develop` (b013043).** Lead's full run before the merge, per ADR 0040: `pnpm check` passes (159 desktop, 30 restore, 44 engine, 139 Vitest), `pnpm test:visual` 225 passed 0 failed, `pnpm art:check` passes.
 - README privacy note for Copy diagnostics written (ADR 0038): what it collects, what it never collects, and that nothing is sent anywhere.
-- Brief 5.8 (`ui`) in flight: align the Settings dev mock's diagnostics text with the real format.
+- Briefs 5.8, 5.9 and 5.9a (`ui`) done (cc812b6, 1536232, and the fixture alignment): the Settings dev mock now produces the core's real diagnostics text and the core's three fixed health-check labels, and the Vitest fixture quotes wording the core really emits.
+  - This mattered beyond tidiness: ADR 0040 makes the Settings screenshots the gate the lead runs before any UI merge, and they had been verifying wording the app never produces. `ui` checked all 18 regenerated screenshots individually by bounding the changed pixels; 17 changed only inside the three-line checks block, and `settings-errors-*` grew 21 px because the core's real failure sentence wraps to a second line.
+  - `ui` flagged rather than silently changed: one assertion in `settings.visual.ts` that quoted an invented sentence, and the Vitest fixture. Both were then fixed on the lead's say-so.
+- **ADR 0042, approved by the user on 2026-11-18:** v0.9 is downloaded from a GitHub pre-release, not auto-updated. §13.5 said "via auto-update" although no updater, `latest.json` or updater key exists and §14 puts all three in Phase 6. SPEC.md §13.5 amended.
+- The §12.2 release matrix was written and given to the user as six standalone tests (fresh install and setup; terminals and jumping; display scaling; taskbar and monitors; Do Not Disturb and animation effects; upgrade and uninstall), about 90 minutes in total. It includes the one thing no automated test can prove: that a built app's Settings window may actually invoke `get_diagnostics` (the ACL fix of brief 5.4a).
+- Four spec-versus-reality gaps were closed this session: CI checks that never ran (ADR 0040), a `nightly.yml` that never existed (ADR 0041), a v0.9 auto-update that cannot happen (ADR 0042), and visual baselines that compared against invented wording (briefs 5.8, 5.9).
 Next:
-- The §12.2 release matrix for the user, then G3 is Phase 6's gate; Phase 5 ends at v0.9.
+- Bump the version to 0.9.0 when the user is ready to build, then the user runs the §12.2 matrix.
+- When it passes: Phase 5 ends, the user publishes v0.9 as a pre-release (unsigned installer, Smart App Control, §13.5), then Phase 6 (ship): `release.yml` tag trigger, updater, `latest.json`, landing page, demo recording, and Gate G3.
 - Then: the README privacy note (ADR 0038), the dev-mock alignment, and the §12.2 manual matrix for v0.9.
 - Then: an error-handling survey, the README privacy note (ADR 0038), and the §12.2 manual matrix for v0.9.
 - Brief 5.4: the core side of `get_diagnostics()`, the ADR 0039 start-up rule, the restored last-event time, and the finding (5) messages.
