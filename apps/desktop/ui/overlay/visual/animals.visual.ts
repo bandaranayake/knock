@@ -91,6 +91,25 @@ async function shot(page: Page, name: string) {
 
 const loop = (page: Page) => page.locator(".stage");
 
+/**
+ * Counts drawn frames: the renderer writes `data-drawn` on the stage every time it draws
+ * (animals/renderer.ts), so every write is one frame. Tells a real animation from a jump,
+ * and makes waiting for a frame exact instead of a guess.
+ */
+async function countFrames(page: Page): Promise<() => Promise<number>> {
+	await page.evaluate(() => {
+		const w = window as unknown as { __drawn: number };
+		w.__drawn = 0;
+		const stage = document.querySelector(".stage");
+		if (!stage) throw new Error("no stage");
+		new MutationObserver((records) => {
+			w.__drawn += records.length;
+		}).observe(stage, { attributeFilter: ["data-drawn"] });
+	});
+	return () =>
+		page.evaluate(() => (window as unknown as { __drawn: number }).__drawn);
+}
+
 const CHIP: Record<SampleKey, string | null> = {
 	permission: "Needs permission: PowerShell",
 	permission_no_tool: "Needs permission",
@@ -471,6 +490,8 @@ test("knocking raises the hit region; leaving Needs you steps down and lowers it
 	page,
 }) => {
 	await open(page, "show=working");
+	const drawn = await countFrames(page);
+	const clock = () => page.evaluate(() => Date.now());
 	const character = page.locator(".character");
 	const top = () =>
 		character.evaluate((e) => Number.parseFloat((e as HTMLElement).style.top));
@@ -486,12 +507,33 @@ test("knocking raises the hit region; leaving Needs you steps down and lowers it
 	await page.clock.runFor(2000);
 	await expect(loop(page)).toHaveAttribute("data-loop", "running");
 	await shot(page, "animals-knocking");
+	// Back to Working: the hit region drops at once and `step_down` (400 ms) starts at the
+	// clock's reading now, which only `runFor` moves.
+	const startedAt = await clock();
 	await mock(page, (m) =>
 		m.set("working", { state: "working", tier: "working", needs: null }),
 	);
 	await expect.poll(top).toBe(low);
+	expect(await clock()).toBe(startedAt);
+	const beforeStep = await drawn();
 	await page.clock.runFor(200); // half-way down
+	expect(await clock()).toBe(startedAt + 200);
+	// It steps down, it does not jump: the loop drew frames all the way (30 fps at most,
+	// so at least 4 of them in 200 ms).
+	expect(await drawn()).toBeGreaterThanOrEqual(beforeStep + 4);
 	await expect(loop(page)).toHaveAttribute("data-loop", "running");
+	// Pins the frame the screenshot catches. Playwright's fake clock puts animation frames
+	// on a 16 ms grid whose phase carries a few milliseconds of real time (a new document
+	// replays the `install` and `pauseAt` calls, and the gap between those two is real), so
+	// the last frame of `runFor` landed anywhere in a 32 ms window and the fox was drawn up
+	// to a pixel higher or lower from run to run. A repeated `sessions-changed` restarts
+	// nothing (controller `nextPlan`) and draws one more frame, at exactly the clock's
+	// reading: 200 ms into `step_down`, the same pose every run.
+	const beforePin = await drawn();
+	await mock(page, (m) => m.set("working", {}));
+	await expect.poll(drawn).toBeGreaterThan(beforePin);
+	expect(await clock()).toBe(startedAt + 200);
+	expect(await top()).toBe(low);
 	await shot(page, "animals-stepping-down");
 	await page.clock.runFor(2000);
 	await expect(loop(page)).toHaveAttribute("data-loop", "stopped");
