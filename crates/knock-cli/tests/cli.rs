@@ -9,6 +9,7 @@ fn bad_or_missing_arguments_print_usage_and_fail() {
         &["nope"],
         &["fixtures", "sanitize", "x"],
         &["fixtures", "check"],
+        &["doctor", "extra"],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_knock"))
             .args(args)
@@ -36,6 +37,210 @@ fn check_of_a_folder_with_no_fixtures_fails() {
         String::from_utf8_lossy(&out.stderr).trim(),
         "error: no fixture files found, 0 checked"
     );
+}
+
+/// `knock doctor` (FR-12) on temporary files only: `APPDATA`,
+/// `CLAUDE_CONFIG_DIR` and `USERPROFILE` all point into a temp folder, so the
+/// real settings file and `%APPDATA%\Knock` are never read.
+mod doctor {
+    use knock_core::{Adapter, ClaudeCode};
+    use serde_json::{Map, Value, json};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+
+    /// Made up, the shape of a real one (43 base64url characters).
+    const TOKEN: &str = "doctor-cli-token-AAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    struct Home(PathBuf);
+
+    impl Home {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("knock-doctor-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("AppData").join("Knock")).unwrap();
+            std::fs::create_dir_all(dir.join("claude")).unwrap();
+            Self(dir)
+        }
+        fn server(&self, port: u16) {
+            let cfg = format!(r#"{{"port":{port},"token":"{TOKEN}"}}"#);
+            std::fs::write(
+                self.0.join("AppData").join("Knock").join("server.json"),
+                cfg,
+            )
+            .unwrap();
+        }
+        /// Every handler setup writes, for `port`.
+        fn installed(&self, port: u16) {
+            let spec = ClaudeCode { users: vec![] }.hooks();
+            let mut hooks = Map::new();
+            for (event, matcher) in spec.events {
+                let h = json!({
+                    "type": "http",
+                    "url": format!("http://127.0.0.1:{port}{}", spec.path),
+                    "headers": { "X-Knock-Token": TOKEN },
+                    "timeout": 1
+                });
+                let mut g = Map::new();
+                if let Some(m) = matcher {
+                    g.insert("matcher".into(), json!(m));
+                }
+                g.insert("hooks".into(), json!([h]));
+                hooks.insert(event.to_string(), json!([g]));
+            }
+            let v = json!({ "hooks": hooks });
+            std::fs::write(self.settings(), serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+        }
+        fn settings(&self) -> PathBuf {
+            self.0.join("claude").join("settings.json")
+        }
+        fn files(&self) -> Vec<(PathBuf, Vec<u8>)> {
+            fn walk(p: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+                for e in std::fs::read_dir(p).unwrap() {
+                    let p = e.unwrap().path();
+                    match p.is_dir() {
+                        true => walk(&p, out),
+                        false => out.push((p.clone(), std::fs::read(&p).unwrap())),
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&self.0, &mut out);
+            out.sort();
+            out
+        }
+        /// Runs `knock doctor`; checks it wrote nothing and printed no token
+        /// or path.
+        fn doctor(&self) -> Output {
+            let before = self.files();
+            let out = Command::new(env!("CARGO_BIN_EXE_knock"))
+                .arg("doctor")
+                .env("APPDATA", self.0.join("AppData"))
+                .env("CLAUDE_CONFIG_DIR", self.0.join("claude"))
+                .env("USERPROFILE", self.0.join("profile"))
+                .output()
+                .unwrap();
+            assert_eq!(self.files(), before, "doctor wrote something");
+            assert!(!self.0.join("profile").exists());
+            let tmp = std::env::temp_dir().display().to_string();
+            for s in [&out.stdout, &out.stderr] {
+                let s = String::from_utf8_lossy(s);
+                for bad in [TOKEN, "\\", tmp.as_str()] {
+                    assert!(!s.contains(bad), "{bad:?} in {s}");
+                }
+            }
+            assert!(out.stderr.is_empty());
+            out
+        }
+    }
+
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A stand-in for Knock on 127.0.0.1, on a port in the §8.1 range, that
+    /// answers one request with `status` and `body`.
+    fn stand_in(status: &'static str, body: String) -> u16 {
+        let seed = std::process::id() as usize * 31;
+        let listener = (0..16384)
+            .map(|i| 49152 + ((seed + i * 104_729) % 16384) as u16)
+            .find_map(|p| TcpListener::bind((Ipv4Addr::LOCALHOST, p)).ok())
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut conn = BufReader::new(conn);
+            let mut head = String::new();
+            while !head.ends_with("\r\n\r\n") && conn.read_line(&mut head).unwrap() > 0 {}
+            let ok = head.starts_with("GET /v1/health HTTP/1.1\r\n")
+                && head.contains(&format!("\r\nX-Knock-Token: {TOKEN}\r\n"));
+            let (status, body) = if ok {
+                (status, body)
+            } else {
+                ("400 Bad Request", String::new())
+            };
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = conn.get_mut().write_all(reply.as_bytes());
+        });
+        port
+    }
+
+    fn stdout_lines(out: &Output) -> Vec<String> {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn all_three_pass_exits_0() {
+        let home = Home::new("pass");
+        let body: Value = json!({
+            "version": "0.3.0",
+            "uptimeS": 5,
+            "sessionCount": 1,
+            "lastEventAt": "2000-01-01T00:00:00.000Z",
+        });
+        let port = stand_in("200 OK", body.to_string());
+        home.server(port);
+        home.installed(port);
+        let out = home.doctor();
+        assert_eq!(out.status.code(), Some(0), "{:?}", stdout_lines(&out));
+        let lines = stdout_lines(&out);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].starts_with("PASS  Connected to Claude Code: "));
+        assert!(lines[1].starts_with("PASS  Listening for Claude Code: "));
+        assert!(lines[2].starts_with("PASS  Last event from Claude Code: Knock last heard"));
+        assert!(lines[2].ends_with(" days ago."), "{}", lines[2]);
+        assert_eq!(lines[3], "Knock 0.3.0 is running, 1 session.");
+    }
+
+    #[test]
+    fn any_failure_exits_1() {
+        // Knock never started: no server.json, no settings file.
+        let out = Home::new("none").doctor();
+        assert_eq!(out.status.code(), Some(1));
+        let lines = stdout_lines(&out);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines.iter().all(|l| l.starts_with("FAIL  ")), "{lines:?}");
+        // Listening, but the hooks are missing and nothing was heard yet.
+        let home = Home::new("partial");
+        let body =
+            json!({ "version": "0.3.0", "uptimeS": 5, "sessionCount": 0, "lastEventAt": null });
+        let port = stand_in("200 OK", body.to_string());
+        home.server(port);
+        std::fs::write(home.settings(), b"{}").unwrap();
+        let out = home.doctor();
+        assert_eq!(out.status.code(), Some(1));
+        let lines = stdout_lines(&out);
+        assert!(
+            lines[0].starts_with("FAIL  Connected to Claude Code: "),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].starts_with("PASS  Listening for Claude Code: "),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].starts_with("FAIL  Last event from Claude Code: "),
+            "{lines:?}"
+        );
+        // Refused (401).
+        let home = Home::new("401");
+        let port = stand_in("401 Unauthorized", String::new());
+        home.server(port);
+        home.installed(port);
+        let out = home.doctor();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(stdout_lines(&out)[1].starts_with("FAIL  Listening for Claude Code: "));
+    }
 }
 
 mod sim {
