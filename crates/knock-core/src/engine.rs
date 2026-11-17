@@ -27,8 +27,9 @@
 //! (escalation, stall, the 60 s fade) count from the restore time, while its
 //! `since` and the 6-hour rule's last-event time stay as saved. A restored
 //! episode doesn't know who was waiting (no agent ids are saved), so it waits
-//! on one unknown requester: the first activity from an agent that isn't a
-//! known waiting requester, or the main agent's Stop, stands for it.
+//! on one unknown requester, which only activity can stand for: the main
+//! agent's Stop never clears it, because it may be a sub-agent that is still
+//! waiting (ADR 0037 item 5).
 
 use crate::adapter::{is_id, project_key};
 use crate::event::{Category, Event, Kind};
@@ -322,10 +323,17 @@ impl Session {
         }
     }
 
-    /// §8.4 "Process gone without `session.ended`": `ended_unexpectedly`,
-    /// except that `failed` stays `failed`.
-    fn gone(&mut self, now: u64) {
-        self.gone_at.get_or_insert(now);
+    /// §8.4 "Process gone without `session.ended`": `ended_unexpectedly` as
+    /// of `now`, except that `failed` stays `failed`.
+    ///
+    /// `gone_since` starts the 6-hour removal clock: `now` when Knock itself
+    /// saw the process go, but the saved last-event time for a session that
+    /// was already gone when Knock started, since Knock cannot know when it
+    /// went and the 6-hour rule uses the last event (§8.4 Restore, ADR 0037
+    /// item 4). The state is entered at `now` either way, so the 60 s fade
+    /// and the time the user sees both count from the restart.
+    fn gone(&mut self, now: u64, gone_since: u64) {
+        self.gone_at.get_or_insert(gone_since);
         if self.state != State::Failed {
             self.set(State::EndedUnexpectedly, now);
         }
@@ -461,7 +469,8 @@ impl Engine {
             Input::SetSuppressed(on) => self.suppressed = on,
             Input::ProcessGone { session_id, now } => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                    s.gone(now);
+                    // Knock saw it go now, so the 6-hour clock starts now.
+                    s.gone(now, now);
                 }
             }
         }
@@ -481,9 +490,10 @@ impl Engine {
     ///   waits on one unknown requester (item 5).
     /// - [`Liveness::Gone`] follows the "Process gone" row at `now`: the 60 s
     ///   fade counts from the restart; `failed` stays `failed` (item 3).
-    /// - The escalation and stall clocks count from `now`; the 6-hour rule
-    ///   keeps the saved last-event time (item 4), so a session it already
-    ///   removes is not restored.
+    /// - The escalation and stall clocks count from `now`. The 6-hour rule
+    ///   counts from the saved last-event time whatever the liveness
+    ///   (item 4), so a session it already removes is not restored and a
+    ///   restart never gives a stale session another 6 hours.
     ///
     /// Returns how many sessions were restored.
     pub fn restore(&mut self, saved: Vec<Saved>, now: u64) -> Result<usize, RestoreError> {
@@ -535,7 +545,9 @@ impl Engine {
                 clock_from: now,
             };
             if s.process == Liveness::Gone {
-                session.gone(now);
+                // It went while Knock was closed. The 60 s fade counts from
+                // the restart, the 6-hour rule from the saved last event.
+                session.gone(now, s.last_event);
             }
             if !session.expired(now) {
                 self.sessions.push(session);
@@ -615,8 +627,10 @@ impl Engine {
             }
             // Removes that requester only; closes when none is left (ADR
             // 0019), to ready if the main agent's turn is done (ADR 0021).
+            // Activity is the one input that may stand for a restored
+            // episode's unknown requester (ADR 0037 item 5).
             (Kind::Activity, NeedsInput) => {
-                if remove(s, &e.context.agent_id) == 0 {
+                if remove(s, &e.context.agent_id, true) == 0 {
                     if s.turn_done {
                         s.set(Ready, ts);
                         fx.push(Effect::ReadyBatchAdd {
@@ -658,10 +672,13 @@ impl Engine {
                     self.open(i, e, waiting, unknown, fx);
                 }
             }
-            // The Stop removes the main agent only (ADR 0019).
+            // The Stop removes the main agent only (ADR 0019), and never a
+            // restored episode's unknown requester: that may be a sub-agent
+            // still waiting, so the knock stays (ADR 0037 item 5, §6
+            // Reliability).
             (Kind::TurnCompleted, NeedsInput | Working | Stalled) => {
                 s.turn_done = true;
-                if remove(s, &None) == 0 {
+                if remove(s, &None, false) == 0 {
                     s.set(Ready, ts);
                     fx.push(Effect::ReadyBatchAdd {
                         session_id: s.id.clone(),
@@ -806,14 +823,19 @@ fn dedup(s: &mut Session, e: &Event) -> bool {
 }
 
 /// Removes `who` from the open episode's requesters; returns how many are
-/// left (0 when no episode is open). An agent that isn't a known waiting
-/// requester stands for the unknown one from before a restart, if any
-/// (ADR 0037 item 5).
-fn remove(s: &mut Session, who: &Option<String>) -> usize {
+/// left (0 when no episode is open).
+///
+/// `stand_in`: `who` may stand for a restored episode's unknown requester
+/// when it is not a known waiting requester (ADR 0037 item 5). Only
+/// `activity` passes `true`. `turn.completed` passes `false`, because the
+/// unknown requester may be a sub-agent that is still waiting: consuming it
+/// would turn an unanswered knock into a calm "ready" with no later event
+/// to put it back (§6 Reliability, zero missed Needs-you).
+fn remove(s: &mut Session, who: &Option<String>, stand_in: bool) -> usize {
     s.needs.as_mut().map_or(0, |n| {
         if n.waiting.contains(who) {
             n.waiting.retain(|a| a != who);
-        } else {
+        } else if stand_in {
             n.unknown = false;
         }
         n.waiting.len() + usize::from(n.unknown)

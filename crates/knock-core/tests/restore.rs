@@ -8,6 +8,8 @@ use knock_core::{
 
 const MIN: u64 = 60_000;
 const HOUR: u64 = 60 * MIN;
+/// §8.4: an ended session fades after 60 s.
+const FADE: u64 = 60_000;
 /// When Knock closed (the last save).
 const T0: u64 = 1_792_166_400_000;
 /// When Knock started again.
@@ -267,8 +269,9 @@ fn item3_a_gone_process_ends_unexpectedly_and_fades_60s_after_the_restart() {
     }
 }
 
-// Item 3: Failed stays Failed until dismissed (or the 6-hour rule, counted
-// from the restore time, when the process was found gone).
+// Item 3: Failed stays Failed until dismissed, or until the 6-hour rule
+// removes it counting from the SAVED last event (item 4), not from the
+// restart: restarting Knock never gives a stale session another 6 hours.
 #[test]
 fn item3_failed_stays_failed_when_its_process_is_gone() {
     let mut s = saved(State::Failed);
@@ -278,8 +281,11 @@ fn item3_failed_stays_failed_when_its_process_is_gone() {
     assert_eq!(h.s1().since, T0 - 2 * MIN, "time in state kept");
     assert_eq!(ticks(&mut h, R, R + 10 * MIN), vec![]);
     assert_eq!(h.state(), Some(State::Failed));
-    assert_eq!(h.tick(R + 6 * HOUR - 1), vec![]);
-    assert_eq!(h.tick(R + 6 * HOUR), vec![Persist]);
+    // The saved last event was at T0 - 1 min, 31 minutes before the restart.
+    let removal = T0 - MIN + 6 * HOUR;
+    assert!(removal < R + 6 * HOUR, "not six hours from the restart");
+    assert_eq!(h.tick(removal - 1), vec![]);
+    assert_eq!(h.tick(removal), vec![Persist]);
     assert_eq!(h.state(), None);
     // Dismiss removes it.
     let mut s = saved(State::Failed);
@@ -404,6 +410,112 @@ fn item4_the_six_hour_rule_uses_the_saved_last_event_time() {
         now: R + 7 * HOUR,
     });
     assert_eq!(h.state(), Some(State::EndedUnexpectedly));
+    // From there the 60 s fade removes it, well before any 6-hour clock.
+    assert_eq!(h.tick(R + 7 * HOUR + FADE - 1), vec![]);
+    assert_eq!(h.tick(R + 7 * HOUR + FADE), vec![Persist]);
+    assert_eq!(h.state(), None);
+}
+
+// Item 4: a session whose process is found gone keeps the 6-hour clock of
+// its saved last event, so restarting Knock over and over never keeps a
+// stale session alive. (Found by the fresh review of f6881dc.)
+#[test]
+fn item4_restarting_does_not_restart_the_six_hour_clock() {
+    let removal = T0 - MIN + 6 * HOUR;
+    // Failed at T0 - 2 min, terminal closed, Knock restarted every hour.
+    let mut at = R;
+    while at < removal {
+        let mut s = saved(State::Failed);
+        s.process = Liveness::Gone;
+        let mut e = Engine::new(Settings::default());
+        assert_eq!(e.restore(vec![s.clone()], at), Ok(1), "restart at {at}");
+        let mut h = H(e);
+        assert_eq!(h.state(), Some(State::Failed));
+        // The saved last event never moves, so neither does the removal.
+        assert_eq!(h.tick(removal - 1), vec![]);
+        assert_eq!(h.tick(removal), vec![Persist], "restart at {at}");
+        assert_eq!(h.state(), None);
+        at += HOUR;
+    }
+    // A restart at or after the removal time doesn't restore it at all.
+    let mut s = saved(State::Failed);
+    s.process = Liveness::Gone;
+    let mut e = Engine::new(Settings::default());
+    assert_eq!(e.restore(vec![s], removal), Ok(0));
+    assert!(e.sessions().is_empty());
+}
+
+/// §6 Reliability (zero missed Needs-you), the failure case the fresh
+/// review of f6881dc found: a sub-agent asked for permission, so the session
+/// is `needs_input` waiting on it while the main agent works. Knock
+/// restarts. The main agent's turn then finishes. The sub-agent is blocked
+/// and sends nothing more, so if the Stop closed the episode the knock would
+/// be lost for good and the strip would show a calm "ready".
+#[test]
+fn a_subagents_knock_survives_a_restart_and_the_main_agents_stop() {
+    // Before the restart: a sub-agent's request, the main agent working.
+    let mut e = Engine::new(Settings::default());
+    let send = |e: &mut Engine, ev: Event| {
+        e.step(Input::Event {
+            event: ev,
+            simulated: false,
+        })
+    };
+    send(&mut e, ev(Kind::TurnStarted, T0 - 5 * MIN));
+    send(&mut e, agent(request(T0 - 2 * MIN), "sub"));
+    assert_eq!(e.sessions()[0].state, State::NeedsInput);
+    // Saved, Knock closes, the process is still alive at the restart.
+    let snap: Vec<_> = (e.sessions().iter())
+        .map(|s| Saved::of(s, Liveness::Alive))
+        .collect();
+    let mut e = Engine::new(Settings::default());
+    e.restore(snap, R).unwrap();
+    let mut h = H(e);
+    // The main agent finishes. The knock stays: the waiting requester is
+    // the sub-agent, which the Stop knows nothing about.
+    let fx = h.send(ev(Kind::TurnCompleted, R + 1000));
+    assert!(
+        !fx.contains(&ready_add()),
+        "a sub-agent's knock was lost: {fx:?}"
+    );
+    assert_eq!(h.state(), Some(State::NeedsInput));
+    let n = h.s1().needs.clone().unwrap();
+    assert_eq!(
+        (n.kind, n.label.as_deref(), n.seen),
+        (NeedsKind::Permission, Some("Write"), false)
+    );
+    // The user can still clear it: answering it produces activity, which
+    // closes the episode to ready because the main turn is done (ADR 0021).
+    assert_eq!(
+        h.send(agent(ev(Kind::Activity, R + 2000), "sub")),
+        vec![ready_add(), Persist]
+    );
+    assert_eq!(h.state(), Some(State::Ready));
+}
+
+/// The accepted consequence of the fix: a restored episode whose session
+/// finishes its turn with no activity at all keeps knocking. A click still
+/// calms it (ADR 0016) and it never escalates afterwards.
+#[test]
+fn a_lingering_restored_knock_can_be_cleared_by_the_user() {
+    let mut h = H::one(needs(false, false));
+    h.send(ev(Kind::TurnCompleted, R + 1000));
+    assert_eq!(h.state(), Some(State::NeedsInput));
+    // It escalates once, on its restored clock, then never again.
+    assert_eq!(h.tick(R + 5 * MIN), vec![escalate(), Persist]);
+    let mut ack = ev(Kind::UserAck, R + 6 * MIN);
+    ack.context = Context::default();
+    assert_eq!(h.send(ack), vec![Persist]);
+    assert!(h.s1().needs.as_ref().unwrap().seen, "calm after a click");
+    assert_eq!(ticks(&mut h, R + 6 * MIN, R + 3 * HOUR), vec![]);
+    assert_eq!(h.state(), Some(State::NeedsInput));
+    // And these still close it, as §8.4 says.
+    for close in [Kind::TurnStarted, Kind::AgentFailed, Kind::SessionEnded] {
+        let mut h = H::one(needs(false, false));
+        h.send(ev(Kind::TurnCompleted, R + 1000));
+        h.send(ev(close, R + 2000));
+        assert_ne!(h.state(), Some(State::NeedsInput), "{close:?}");
+    }
 }
 
 // Item 5: the first activity, from the main agent or any sub-agent, closes
@@ -530,27 +642,44 @@ fn item5_a_new_request_after_a_seen_restored_episode_knocks() {
     assert_eq!(h.state(), Some(State::Working));
 }
 
-// Item 5: the main agent's Stop closes a restored episode to ready (the
-// unknown requester can't be told from the main agent), unless a requester
-// that joined after the restore still waits (ADR 0019).
+// Item 5 + §8.4 ("ready once no sub-agent is waiting"): the main agent's
+// Stop removes the main agent only. It never stands for the unknown
+// requester, which may be a sub-agent still waiting, so the episode stays
+// open whether or not the main agent had joined it.
 #[test]
 fn item5_turn_completed_on_a_restored_episode() {
     let mut h = H::one(needs(false, false));
+    assert_eq!(h.send(ev(Kind::TurnCompleted, R + 1000)), vec![]);
+    assert_eq!(h.state(), Some(State::NeedsInput), "no missed knock");
+    assert!(h.s1().needs.as_ref().unwrap().unknown_requester());
+    assert!(h.s1().turn_done());
+    // The turn is done, so the next activity closes it to ready (ADR 0021).
     assert_eq!(
-        h.send(ev(Kind::TurnCompleted, R + 1000)),
+        h.send(ev(Kind::Activity, R + 2000)),
         vec![ready_add(), Persist]
     );
     assert_eq!(
         (h.state(), h.s1().needs.clone()),
         (Some(State::Ready), None)
     );
-    assert!(h.s1().turn_done());
+    // With a sub-agent that joined after the restart, the Stop changes
+    // nothing at all: it is not a waiting requester and it no longer
+    // consumes the unknown one.
     let mut h = H::one(needs(false, false));
     h.send(agent(request(R + 1000), "a2"));
-    assert_eq!(h.send(ev(Kind::TurnCompleted, R + 2000)), vec![Persist]);
+    assert_eq!(h.send(ev(Kind::TurnCompleted, R + 2000)), vec![]);
     assert_eq!(h.state(), Some(State::NeedsInput));
+    assert_eq!(h.waiting(), [Some("a2")]);
+    assert!(h.s1().needs.as_ref().unwrap().unknown_requester());
+    // a2 answers; the unknown requester still waits.
     assert_eq!(
         h.send(agent(ev(Kind::Activity, R + 3000), "a2")),
+        vec![Persist]
+    );
+    assert_eq!(h.state(), Some(State::NeedsInput));
+    // Any further activity stands for the unknown one and closes it.
+    assert_eq!(
+        h.send(agent(ev(Kind::Activity, R + 4000), "a3")),
         vec![ready_add(), Persist]
     );
     assert_eq!(h.state(), Some(State::Ready));

@@ -330,6 +330,10 @@ impl Core {
                 let sessions = self.engine.sessions();
                 procs.retain(|id, _| sessions.iter().any(|s| &s.id == id));
                 let live = procs.len();
+                // FR-12: the health check knows when Knock last heard from
+                // Claude Code, so it reports that instead of "no events".
+                // Only the sessions the engine kept count.
+                self.last_event_at = sessions.iter().map(|s| s.last_event).max();
                 self.procs = procs;
                 tracing::info!(
                     restored,
@@ -1934,6 +1938,38 @@ mod tests {
         assert!(outs.contains(&Out::Tray(1)));
     }
 
+    /// FR-12: after a restore the health check reports when Knock last heard
+    /// from Claude Code, not "no events". It is the newest saved
+    /// `lastEventMs` among the sessions that actually came back.
+    #[test]
+    fn restoring_seeds_the_health_checks_last_event_time() {
+        let mut t = core("restore-last-event");
+        *t.fake.alive.lock().unwrap() = vec![P1];
+        t.hook(0, "a", "UserPromptSubmit", "", Some(P1));
+        t.hook(7000, "b", "Stop", "", Some(P1));
+        assert_eq!(read(&t.shared).last_event_at, Some(T0 + 7000));
+        t.restart(9000);
+        assert_eq!(
+            read(&t.shared).last_event_at,
+            Some(T0 + 7000),
+            "the newest saved event, not none and not the restart"
+        );
+        // A session the 6-hour rule drops on the way in doesn't count: only
+        // "b" survives, so its own last event is reported.
+        let mut t = core("restore-last-event-dropped");
+        t.hook(0, "a", "Stop", "", None);
+        t.hook(1000, "b", "Stop", "", Some(P1));
+        *t.fake.alive.lock().unwrap() = vec![P1];
+        t.restart(6 * 60 * MIN);
+        let ids: Vec<_> = t.views().iter().map(|v| v.id.clone()).collect();
+        assert_eq!(ids, ["b"], "the one with no process is dropped");
+        assert_eq!(read(&t.shared).last_event_at, Some(T0 + 1000));
+        // Nothing restored: nothing to report, as on a first run.
+        let mut t = core("restore-last-event-none");
+        t.restart(1000);
+        assert_eq!(read(&t.shared).last_event_at, None);
+    }
+
     /// Item 3 and 6 through the whole shell: a live process, one that is
     /// gone, one whose PID another process now has, and no process at all.
     #[test]
@@ -1993,6 +2029,58 @@ mod tests {
         // The one with no recorded process still follows the 6-hour rule.
         t.core.tick(T0 + 6 * 60 * MIN, NOON);
         assert!(t.views().is_empty(), "ADR 0018 item 7");
+    }
+
+    /// §6 Reliability through the whole shell: a Needs-you session restored
+    /// from the file is not turned into a calm "ready" by the main agent's
+    /// Stop, because the agent that was waiting is not recorded (no agent
+    /// ids are saved). Found by the fresh review of f6881dc.
+    #[test]
+    fn a_restored_knock_is_not_lost_when_the_turn_ends() {
+        let mut t = core("restore-knock-kept");
+        *t.fake.alive.lock().unwrap() = vec![P1];
+        // A sub-agent asks; the session is Needs you.
+        let sub = r#","agent_id":"sub","tool_name":"Write""#;
+        t.hook(0, "a", "PermissionRequest", sub, Some(P1));
+        assert_eq!(t.views()[0].state, "needs_input");
+        t.restart(1000);
+        assert_eq!(t.views()[0].state, "needs_input");
+        // The main agent finishes its turn: the knock stays, nothing is
+        // batched as Ready, and the tray still counts it.
+        let outs = t.hook(2000, "a", "Stop", "", Some(P1));
+        assert_eq!(t.views()[0].state, "needs_input", "a missed knock");
+        assert!(t.core.ready.is_empty(), "FR-8: not Ready yet");
+        assert!(toasts(&outs).is_empty(), "no second knock either");
+        assert_eq!(t.views()[0].tier, "needs_you");
+        // Answering it produces activity, which closes it to Ready.
+        t.hook(
+            3000,
+            "a",
+            "PostToolUse",
+            r#","tool_name":"Write""#,
+            Some(P1),
+        );
+        assert_eq!(t.views()[0].state, "ready");
+        assert_eq!(t.core.ready, ["a"]);
+    }
+
+    /// Item 4 through the shell: a session found gone keeps the 6-hour clock
+    /// of its saved last event, so repeated restarts never keep a stale
+    /// character alive. Found by the fresh review of f6881dc.
+    #[test]
+    fn restarting_does_not_give_a_stale_session_another_six_hours() {
+        let mut t = core("restore-stale");
+        t.hook(0, "a", "StopFailure", r#","error":"rate_limit""#, Some(P1));
+        assert_eq!(t.views()[0].state, "failed");
+        // Its terminal is closed, and Knock is restarted five hours later.
+        *t.fake.alive.lock().unwrap() = vec![];
+        t.restart(5 * 60 * MIN);
+        assert_eq!(t.views()[0].state, "failed", "ADR 0037 item 3");
+        // One hour after that, six hours after the last event, it goes.
+        t.core.tick(T0 + 6 * 60 * MIN - 1, NOON);
+        assert_eq!(t.views().len(), 1);
+        t.core.tick(T0 + 6 * 60 * MIN, NOON);
+        assert!(t.views().is_empty(), "not six hours from the restart");
     }
 
     /// Item 7: nothing is restored, nothing panics, and the file is left
