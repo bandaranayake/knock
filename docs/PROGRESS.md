@@ -16,6 +16,27 @@ Open questions for the user:
 
 ---
 
+## 2026-11-17: Phase 5 (hardening) started
+Done:
+- **Gate G2 passed** (user decision, 2026-11-17). Phase 4 is closed.
+- Local `develop` fast-forwarded to `origin/develop` (it was 9 commits behind).
+- Survey by the lead of what Phase 5 needs:
+  - Already built: the health check command and its screen in Settings (FR-12, Phase 2); `ended_unexpectedly` and the `crash` scenario.
+  - Not built: `knock doctor` (only named in the usage text); restoring `sessions.json` at start (FR-13; the file is written but never read); the **Copy diagnostics** button (§11 rule 8).
+- Brief 5.1 sent to `core-windows` on `phase-5/doctor`: `knock doctor`, read-only, inside `crates/knock-cli/`.
+- Three ADRs written, all **Proposed**. The user's choices of 2026-11-17 are recorded in them:
+  - ADR 0037, restoring sessions after a restart: a Needs-you session knocks again with no second notification; a session whose program is gone shows "Session ended".
+  - ADR 0038, a `get_diagnostics()` command: Settings shows the version and gets a **Copy diagnostics** button.
+  - ADR 0039, deferred finding (4): setup opens by itself only until it has been finished once.
+Next:
+- Review brief 5.1 (lead review, then a fresh review: it reads §8.1 and §8.2 files).
+- After the user approves each ADR: brief 5.2, FR-13 restore (`core-windows`); brief 5.3, diagnostics (`core-windows`, then `ui`); brief 5.4, the start-up rule and the deferred finding (5) messages.
+- Then: an error-handling survey, the health check screen polish (`ui`), and the §12.2 manual matrix for v0.9.
+Dependencies added: none
+Clarifications: none
+Open questions for the user:
+- Approval of ADRs 0037, 0038 and 0039. In 0037 the lead proposes that the escalation and stall clocks restart when Knock starts. In 0039 the lead added that an unfinished setup is offered again.
+
 ## 2026-11-06: Phase 4, public beta preparation
 Done:
 - ADR 0035 (approved by the user): v0.3 is a **public** beta via a GitHub pre-release, and the user judges G2 from setup reports. SPEC.md §13.5 and §14 were updated.
@@ -43,7 +64,6 @@ Done:
   - Setup works.
 - README badges, added by the user: the beta badge works. The shields.io license badge showed "repo not found", a stale cache from when the repo was private (GitHub's API reports MIT). The user chose to leave it as is.
 Next:
-- Gate G2: the user judges it from setup reports.
 - Gate G2: the user judges it from setup reports.
 Dependencies added: none
 Clarifications: none
