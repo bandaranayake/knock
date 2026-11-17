@@ -70,6 +70,15 @@ If Knock isn't running, Claude Code carries on normally. The hooks fail quickly 
 
 Knock never reads your conversations, prompts or code. No telemetry, no accounts, no internet. Everything stays on your computer.
 
+**Copy diagnostics**, in Settings, is the one time Knock gathers anything about your machine, and it only puts it on your clipboard — nothing is sent anywhere. Paste it somewhere first if you want to read it before sharing. It contains:
+
+- Knock's version and your Windows version.
+- The results of Knock's own health check.
+- How many sessions Knock is tracking, and how many displays you have with their scaling.
+- Your Knock settings, such as size and whether notifications are paused.
+
+It never contains your project names, your folder paths, your user name, or anything you or Claude Code wrote.
+
 ## Uninstall
 
 1. Open Knock's **Settings** (tray icon) and click **Remove Knock from Claude Code**.
