@@ -4,6 +4,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+/// Tests only: the §8.5 commands, the ACL and the UI must agree.
+#[cfg(test)]
+mod acl;
 mod diagnostics;
 mod hooks;
 mod jump;
@@ -63,7 +66,9 @@ struct Knock {
     repairing: Mutex<()>,
     /// `%APPDATA%\Knock`.
     dir: PathBuf,
-    /// No Knock `settings.json` existed when the app started.
+    /// The user had never finished setup when the app started, that is
+    /// `launchAtSignIn` was `null` (§8.6, ADR 0039). `setup_status()` reports
+    /// it as `firstRun`, which titles setup's Welcome screen.
     first_run: bool,
 }
 
@@ -552,7 +557,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let platform: Arc<dyn Platform> = Arc::new(WindowsPlatform::new(&window)?);
 
     let dir = settings::data_dir()?;
-    let first_run = !dir.join(settings::FILE).exists();
     let shared = Shared::default();
     let now = pipeline::now_ms();
     let core = pipeline::Core::new(
@@ -562,6 +566,13 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         now,
         platform::local_minute(),
     );
+    // §8.6, ADR 0039: the user has never finished setup while
+    // `launchAtSignIn` is `null`. `setup_status().firstRun` and the rule for
+    // opening setup by itself ([`at_start`]) read the same value, so the
+    // Welcome screen can't say "Set up Knock again" for a setup that was
+    // never finished. Read once, before any window or command can change it.
+    let sign_in = pipeline::read(&shared).settings.launch_at_sign_in;
+    let first_run = setup_unfinished(sign_in);
     let (tx, rx) = std::sync::mpsc::channel();
     let tray = tray::build(app.handle(), tx.clone(), shared.clone())?;
     let listening = Arc::new(Mutex::new(Listening::default()));
@@ -626,15 +637,16 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         first_run,
     };
 
-    // If the port can't be bound, Knock keeps running and offers Repair
-    // (§8.1, ADR 0023).
+    // If the server can't start, Knock keeps running and says why (§8.1,
+    // ADR 0023). The log keeps the step and the real error kind, never a
+    // path or a body (§11.5).
     let started = server::listen(&k.dir).and_then(|(cfg, listener)| {
         let stop = serve(&k, &cfg, listener)?;
         adopt(app.handle(), &k, cfg, stop);
         Ok(())
     });
     if let Err(e) = &started {
-        tracing::error!(kind = ?e.kind(), "server failed to start");
+        tracing::error!(step = ?e.step, kind = ?e.kind(), "server failed to start");
         server_down(app.handle(), &k, Some(server::start_failed(e)));
     }
 
@@ -687,11 +699,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // answered its "Start Knock when you sign in?" step; Repair first if the
     // server isn't running (ADR 0023).
     let installed = k.hooks.installed().unwrap_or(false);
-    let sign_in = pipeline::read(&k.shared).settings.launch_at_sign_in;
+    // `first_run` is "setup never finished", the same value `at_start` uses.
     tracing::info!(
         first_run,
         installed,
-        answered = sign_in.is_some(),
         server = started.is_ok(),
         "setup status"
     );
@@ -725,11 +736,19 @@ enum AtStart {
 /// after **Remove Knock from Claude Code**. A server that can't start comes
 /// first either way (ADR 0023).
 fn at_start(server_ok: bool, _hooks_installed: bool, launch_at_sign_in: Option<bool>) -> AtStart {
-    match (server_ok, launch_at_sign_in) {
+    match (server_ok, setup_unfinished(launch_at_sign_in)) {
         (false, _) => AtStart::Repair,
-        (true, None) => AtStart::Setup,
-        (true, Some(_)) => AtStart::Nothing,
+        (true, true) => AtStart::Setup,
+        (true, false) => AtStart::Nothing,
     }
+}
+
+/// The user has never finished setup: `launchAtSignIn` is still `null`
+/// (§8.6). The one rule for both `setup_status().firstRun`, which titles
+/// setup's Welcome screen, and [`at_start`], so a setup that is offered
+/// again is never greeted with "Set up Knock again".
+fn setup_unfinished(launch_at_sign_in: Option<bool>) -> bool {
+    launch_at_sign_in.is_none()
 }
 
 fn main() {
@@ -775,7 +794,24 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AtStart, at_start};
+    use super::{AtStart, at_start, setup_unfinished};
+
+    /// `setup_status().firstRun` titles setup's Welcome screen, so it has to
+    /// mean the same as "setup opens by itself": a setup that was closed
+    /// before its last step is offered again and must still say "Welcome to
+    /// Knock" (the 2026-11-18 review of efaecac, finding 4). It used to mean
+    /// "settings.json didn't exist", which that user already has.
+    #[test]
+    fn first_run_means_setup_was_never_finished() {
+        assert!(setup_unfinished(None), "never answered");
+        assert!(!setup_unfinished(Some(true)), "answered yes");
+        assert!(!setup_unfinished(Some(false)), "answered no");
+        // The same rule as the one that re-opens setup, for every answer.
+        for answer in [None, Some(true), Some(false)] {
+            let offered = at_start(true, true, answer) == AtStart::Setup;
+            assert_eq!(offered, setup_unfinished(answer), "{answer:?}");
+        }
+    }
 
     /// ADR 0039: setup opens by itself only until the user has answered its
     /// "Start Knock when you sign in?" step.

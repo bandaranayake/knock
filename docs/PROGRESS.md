@@ -86,9 +86,12 @@ Done:
   - The smoke test launches the debug build with `%APPDATA%` pointed at a throwaway folder and `KNOCK_CLAUDE_SETTINGS` cleared, checks `/v1/debug/snapshot` refuses an untokened request (§8.1, §11 rule 1), plays `three-knocks` through the real server with `knock sim`, and asserts the published sessions. It never touches the real `%APPDATA%` or any Claude Code settings file.
   - Honest gaps, stated in the workflow itself: no install, nothing visual, no taskbar maths, no toasts, no tray.
 - **ADR 0041, approved by the user on 2026-11-18:** Knock has no nightly workflow — `nightly.yml` has never existed, although §13.4 listed it since the start. SPEC.md §13.4 drops the row and §12.1's Smoke row now says CI does not install. Also recorded: installing stays the user's manual test, and CI gets no Rust cache (it would need a new action and would break the "exactly one installer" check).
+- **2026-11-18: the user passed both manual tests**, each against a build of `develop`:
+  - `knock doctor` (FR-12): the three lines agree with the in-app health check, and they change as expected when Knock is stopped and started again.
+  - Restart recovery (FR-13): sessions come back after a restart, a knocking session is still knocking, a finished one is still "Done, ready to review", the health check reports a real last-event time, and an ended session fades.
+  - §12.4 item 6 is therefore met for both. The full §12.2 release matrix is still to run before v0.9.
 Next:
-- The user's manual tests of `knock doctor` and restart recovery.
-- Resolve the fresh review of brief 5.4, land brief 5.6, then merge `phase-5/diagnostics-core`.
+- Resolve the fresh review of brief 5.4, then merge `phase-5/diagnostics-core`.
 - Then: the README privacy note (ADR 0038), the dev-mock alignment, and the §12.2 manual matrix for v0.9.
 - Then: an error-handling survey, the README privacy note (ADR 0038), and the §12.2 manual matrix for v0.9.
 - Brief 5.4: the core side of `get_diagnostics()`, the ADR 0039 start-up rule, the restored last-event time, and the finding (5) messages.

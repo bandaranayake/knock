@@ -52,31 +52,86 @@ impl ServerConfig {
     }
 }
 
+/// Which step of starting the server failed. Known where it happened, not
+/// guessed from an [`io::ErrorKind`]: reading `server.json`, binding a port
+/// and saving `server.json` can all fail with the same kind, and they need
+/// quite different words ([`start_failed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// `server.json` is there but couldn't be read, or isn't valid.
+    Config,
+    /// No port could be bound.
+    Bind,
+    /// A first run's `server.json` couldn't be saved.
+    Save,
+    /// Anything else: the random source, or the server task itself.
+    Other,
+}
+
+/// Why the server isn't listening: the step that failed, for the words the
+/// user reads, and the error it failed with, for the log (its kind only,
+/// §11.5).
+#[derive(Debug)]
+pub struct StartError {
+    pub step: Step,
+    pub error: io::Error,
+}
+
+impl StartError {
+    fn at(step: Step) -> impl FnOnce(io::Error) -> Self {
+        move |error| Self { step, error }
+    }
+    pub fn kind(&self) -> io::ErrorKind {
+        self.error.kind()
+    }
+}
+
+/// Anything that fails after [`listen`] has handed its listener over (the
+/// server task): no step of its own.
+impl From<io::Error> for StartError {
+    fn from(error: io::Error) -> Self {
+        Self {
+            step: Step::Other,
+            error,
+        }
+    }
+}
+
 /// Loads `server.json` from `dir` and binds its port. On first run (no file)
 /// picks a free port and a new token, then saves them; after that the port is
 /// fixed. A port that can't be bound later is an error; Repair ([`repair`])
-/// picks a new one (ADR 0023). Every error's kind says which step failed, so
+/// picks a new one (ADR 0023). Every error says which step failed, so
 /// [`start_failed`] can say something true about it.
-pub fn listen(dir: &Path) -> io::Result<(ServerConfig, TcpListener)> {
+pub fn listen(dir: &Path) -> Result<(ServerConfig, TcpListener), StartError> {
     match std::fs::read(dir.join("server.json")) {
         Ok(bytes) => {
-            let cfg = parse_config(&bytes)?;
-            let listener = bind(cfg.port)?;
+            let cfg = parse_config(&bytes).map_err(StartError::at(Step::Config))?;
+            let listener = bind(cfg.port).map_err(StartError::at(Step::Bind))?;
             Ok((cfg, listener))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let (cfg, listener) = pick(ServerConfig::generate()?.token, None)?;
-            save(dir, &cfg)?;
+            let token = ServerConfig::generate()
+                .map_err(StartError::at(Step::Other))?
+                .token;
+            // [`pick`] gives AddrInUse only from [`no_free_port`]; anything
+            // else came from the random source inside it.
+            let (cfg, listener) = pick(token, None).map_err(|e| StartError {
+                step: match e.kind() {
+                    io::ErrorKind::AddrInUse => Step::Bind,
+                    _ => Step::Other,
+                },
+                error: e,
+            })?;
+            save(dir, &cfg).map_err(StartError::at(Step::Save))?;
             Ok((cfg, listener))
         }
-        // A file that is there but can't be read. To the user that is the
-        // same as one that isn't valid, and Repair fixes both, so it gets
-        // the same kind. The kind it had is kept in the message, which holds
-        // a file name only (§11.5).
-        Err(e) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("server.json could not be read: {}", e.kind()),
-        )),
+        // The file is there but couldn't be read. To the user that is the
+        // same as one that isn't valid, and both are fixed the same way; the
+        // log keeps the kind it really had.
+        Err(e) => Err(StartError {
+            step: Step::Config,
+            error: e,
+        }),
     }
 }
 
@@ -137,29 +192,32 @@ pub fn repair_failed(e: &io::Error) -> &'static str {
 }
 
 /// `setup_status.serverError` text for a [`listen`] error (ADR 0023, §6
-/// plain language). Repair is the right action for all of them, but they
-/// have quite different causes, so each says something true:
+/// plain language). The [`Step`] that failed decides, so each text is true
+/// of its own case:
 ///
-/// - the saved port is taken, or Windows won't let Knock use it
-///   (`AddrInUse`, `PermissionDenied`, `AddrNotAvailable`), and on a first
-///   run `AddrInUse` also means no free port was found in 50 tries: another
-///   program may hold it, which is what Hyper-V, WSL2 and Docker do;
-/// - `server.json` is there but can't be used (`InvalidData`: not valid, or
-///   not readable), where nothing is using anything: Knock simply can't tell
-///   which connection is its own;
-/// - anything else: a file that couldn't be written, or the random source
-///   failing, so no cause is claimed.
-pub fn start_failed(e: &io::Error) -> &'static str {
-    match e.kind() {
-        io::ErrorKind::AddrInUse
-        | io::ErrorKind::PermissionDenied
-        | io::ErrorKind::AddrNotAvailable => {
+/// - [`Step::Bind`]: the saved port is taken or Windows won't let Knock use
+///   it, and on a first run no free port was found in 50 tries. Another
+///   program may hold it, which is what Hyper-V, WSL2 and Docker do, and
+///   Repair picks another port.
+/// - [`Step::Config`]: `server.json` is there but can't be read or isn't
+///   valid. Nothing is using anything, so the text doesn't say so; Repair
+///   writes a new file.
+/// - [`Step::Save`]: the port was free but Knock couldn't write its own
+///   file. Repair would fail at the same step, so the text doesn't offer it
+///   and names what the user can really do instead.
+/// - [`Step::Other`]: no cause is claimed.
+pub fn start_failed(e: &StartError) -> &'static str {
+    match e.step {
+        Step::Bind => {
             "Knock couldn't start listening for Claude Code. Another program may be using its connection. Choose Repair to give Knock a new one."
         }
-        io::ErrorKind::InvalidData => {
+        Step::Config => {
             "Knock couldn't use its own connection file (server.json), so it couldn't start listening for Claude Code. Choose Repair to make a new connection."
         }
-        _ => {
+        Step::Save => {
+            "Knock couldn't save its own connection file, so it can't listen for Claude Code. Something is stopping Knock from writing in its own folder, often security software. Please allow Knock in your security software, or restart your computer, then start Knock again."
+        }
+        Step::Other => {
             "Knock couldn't start listening for Claude Code, so it can't hear from your sessions. Choose Repair to set up a new connection."
         }
     }
@@ -1032,32 +1090,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Every reason [`listen`] can fail, with the text the user reads for
-    /// it. The old single text claimed another program was using Knock's
-    /// connection, which isn't true for an invalid `server.json` (deferred
-    /// finding 5 of the 2026-11-06 review).
+    /// Every reason [`listen`] can fail, with the step it reports and the
+    /// text the user reads for it. The old single text claimed another
+    /// program was using Knock's connection, which is true of a taken port
+    /// only: not of an invalid `server.json` (deferred finding 5 of the
+    /// 2026-11-06 review) and not of a file Knock couldn't write (the
+    /// 2026-11-18 review of efaecac, finding 2).
     #[test]
-    fn the_server_error_says_something_true_for_each_cause() {
+    fn the_server_error_says_something_true_for_each_step() {
         let busy = "Knock couldn't start listening for Claude Code. Another program may be using its connection. Choose Repair to give Knock a new one.";
         let invalid = "Knock couldn't use its own connection file (server.json), so it couldn't start listening for Claude Code. Choose Repair to make a new connection.";
+        let unwritable = "Knock couldn't save its own connection file, so it can't listen for Claude Code. Something is stopping Knock from writing in its own folder, often security software. Please allow Knock in your security software, or restart your computer, then start Knock again.";
         let other = "Knock couldn't start listening for Claude Code, so it can't hear from your sessions. Choose Repair to set up a new connection.";
+        let text = |step| start_failed(&StartError::at(step)(io::Error::other("x")));
         let dir = temp_dir("start-failed");
         let file = dir.join("server.json");
         // The saved port is held by another program.
         let (cfg, blocker) = listen(&dir).unwrap();
         let e = listen(&dir).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::AddrInUse, "{e:?}");
+        assert_eq!((e.step, e.kind()), (Step::Bind, io::ErrorKind::AddrInUse));
         assert_eq!(start_failed(&e), busy);
         drop(blocker);
-        // No free port left on a first run: the same cause, the same text.
-        assert_eq!(start_failed(&no_free_port()), busy);
-        // Windows refuses the port (an excluded range, for example).
-        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
-        assert_eq!(start_failed(&denied), busy);
-        assert_eq!(
-            start_failed(&io::Error::from(io::ErrorKind::AddrNotAvailable)),
-            busy
-        );
+        // No free port left: the same step, the same text.
+        assert_eq!(text(Step::Bind), busy);
         // `server.json` is there but not valid: nothing is using anything.
         for bad in [
             b"not json".to_vec(),
@@ -1070,21 +1125,40 @@ mod tests {
         ] {
             std::fs::write(&file, &bad).unwrap();
             let e = listen(&dir).unwrap_err();
-            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e:?}");
+            assert_eq!(
+                (e.step, e.kind()),
+                (Step::Config, io::ErrorKind::InvalidData)
+            );
             assert_eq!(start_failed(&e), invalid);
         }
         // `server.json` can't be read at all (here: it is a folder). The
-        // user can't act on the difference, and Repair fixes both.
+        // same words, and the log still gets the kind it really had: the
+        // review of efaecac, finding 3.
         std::fs::remove_file(&file).unwrap();
         std::fs::create_dir(&file).unwrap();
         let e = listen(&dir).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e:?}");
-        assert_eq!(start_failed(&e), invalid, "{e:?}");
-        assert!(e.to_string().starts_with("server.json could not be read"));
-        // Saving a first run's file, or the random source, failing.
-        assert_eq!(start_failed(&io::Error::other("no random bytes")), other);
+        assert_eq!(e.step, Step::Config);
+        assert_ne!(e.kind(), io::ErrorKind::InvalidData, "the real kind: {e:?}");
+        assert_ne!(e.kind(), io::ErrorKind::NotFound, "{e:?}");
+        assert_eq!(start_failed(&e), invalid);
+        std::fs::remove_dir(&file).unwrap();
+        // A first run that can't save `server.json`: the port was free, so
+        // nothing is using anything, and Repair would fail the same way.
+        // Here a folder is in the way of the temporary file.
+        std::fs::create_dir(dir.join("server.json.tmp")).unwrap();
+        let e = listen(&dir).unwrap_err();
+        assert_eq!(e.step, Step::Save, "{e:?}");
+        assert_eq!(start_failed(&e), unwritable);
+        assert!(!unwritable.contains("Repair"), "Repair can't fix this one");
+        std::fs::remove_dir(dir.join("server.json.tmp")).unwrap();
+        // The random source, or the server task, failing.
+        assert_eq!(text(Step::Other), other);
+        assert_eq!(
+            start_failed(&io::Error::other("no random bytes").into()),
+            other
+        );
         // No path, no token and no port in any of them (§11.5).
-        for m in [busy, invalid, other] {
+        for m in [busy, invalid, unwritable, other] {
             assert!(!m.contains('\\') && !m.contains('/'), "{m}");
             assert!(!m.contains(&cfg.port.to_string()) && !m.contains(&cfg.token));
         }
