@@ -1,6 +1,6 @@
 # 0037: Restoring sessions after a restart
 
-- **Status:** Proposed
+- **Status:** Approved by user on 2026-11-17
 - **Date:** 2026-11-17
 - **Spec sections:** §5 (FR-13), §8.4, §9.7 (Process liveness), §11 (rule 4)
 - **VERIFY item:** none
@@ -13,7 +13,7 @@ While Knock is closed it hears nothing from Claude Code. So a restored state can
 
 ## Decision
 
-The user chose items 2 and 3 on 2026-11-17. The other items are proposed by the lead and wait for the user's approval.
+The user chose items 2 and 3 on 2026-11-17 and approved the other items, proposed by the lead, the same day.
 
 1. **Sessions whose program is still running** come back in the state, with the animal and the "time in state", that they had when Knock closed. Simulated sessions are never restored.
 2. **A session that was in Needs you** comes back as it was: knocking if the user had not clicked it, calm if they had (ADR 0016). It is the same episode, so Knock sends no second notification for it. (User's choice. Rejected: every restored Needs-you session comes back calm.)

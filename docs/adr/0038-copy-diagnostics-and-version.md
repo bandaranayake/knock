@@ -1,6 +1,6 @@
 # 0038: Copy diagnostics and the version in Settings
 
-- **Status:** Proposed
+- **Status:** Approved by user on 2026-11-17
 - **Date:** 2026-11-17
 - **Spec sections:** §8.5 (commands), §11 (rules 3, 4, 5, 8), §7.1
 - **VERIFY item:** none
@@ -31,6 +31,7 @@ Add one command to §8.5:
 
 - SPEC.md §8.5 gets the new row.
 - `core-windows` builds the command, with a test that the text holds none of the excluded items. `ui` adds the version line and the button to Settings. No new dependency: the button uses the browser clipboard.
+- The README gets a short privacy note that says exactly what Copy diagnostics copies and what it never copies (user, 2026-11-17). The lead adds it when the button is merged.
 - This touches §11, so the change gets a fresh review (ADR 0029).
 - Project names are left out although §11 rule 4 allows storing them, because testers paste this text into public GitHub issues.
 

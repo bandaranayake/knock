@@ -1,6 +1,6 @@
 # 0039: Setup opens by itself only until it has been finished once
 
-- **Status:** Proposed
+- **Status:** Approved by user on 2026-11-17
 - **Date:** 2026-11-17
 - **Spec sections:** §10.4, §8.6 (`launchAtSignIn`), §8.1 (Repair)
 - **VERIFY item:** none
@@ -13,7 +13,7 @@ On 2026-11-17 the user chose: setup opens by itself only the first time; after t
 
 ## Decision
 
-- Setup opens by itself at start only while the user has never answered the "Start Knock when you sign in?" step, that is, while `launchAtSignIn` is `null` (§8.6). This covers the first run. It also covers a setup that was closed before the user got that far (lead's addition, so a setup closed by accident is offered again).
+- Setup opens by itself at start only while the user has never answered the "Start Knock when you sign in?" step, that is, while `launchAtSignIn` is `null` (§8.6). This covers the first run. It also covers a setup that was closed before the user got that far (lead's addition, approved by the user, so a setup closed by accident is offered again).
 - After that, Knock never opens setup by itself. If it isn't connected to Claude Code, Settings and the health check say so, and setup can be reopened from Settings (§10.4).
 - Unchanged: if the server can't start, the Repair screen still opens at start (ADR 0023).
 

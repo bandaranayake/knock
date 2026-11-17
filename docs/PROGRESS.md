@@ -24,18 +24,22 @@ Done:
   - Already built: the health check command and its screen in Settings (FR-12, Phase 2); `ended_unexpectedly` and the `crash` scenario.
   - Not built: `knock doctor` (only named in the usage text); restoring `sessions.json` at start (FR-13; the file is written but never read); the **Copy diagnostics** button (§11 rule 8).
 - Brief 5.1 sent to `core-windows` on `phase-5/doctor`: `knock doctor`, read-only, inside `crates/knock-cli/`.
-- Three ADRs written, all **Proposed**. The user's choices of 2026-11-17 are recorded in them:
+- Brief 5.1 done (475a1a7): `knock doctor`, read-only, std only. Lead review passed; `pnpm check` passes. The fresh review is running; not merged yet.
+  - Lead fix: `.claude/settings.local.json` added to `.gitignore`, because Biome failed on it (1f93bf0).
+  - Clarifications (lead): doctor always reads the real §8.2 file, also in debug builds, since it only reads. It does not detect a hard-linked settings file (ADR 0024); std can't read a link count.
+- Three ADRs written and **approved by the user on 2026-11-17**. SPEC.md §8.4, §8.5 and §10.4 were updated. The user's choices are recorded in them:
   - ADR 0037, restoring sessions after a restart: a Needs-you session knocks again with no second notification; a session whose program is gone shows "Session ended".
   - ADR 0038, a `get_diagnostics()` command: Settings shows the version and gets a **Copy diagnostics** button.
   - ADR 0039, deferred finding (4): setup opens by itself only until it has been finished once.
 Next:
-- Review brief 5.1 (lead review, then a fresh review: it reads §8.1 and §8.2 files).
-- After the user approves each ADR: brief 5.2, FR-13 restore (`core-windows`); brief 5.3, diagnostics (`core-windows`, then `ui`); brief 5.4, the start-up rule and the deferred finding (5) messages.
+- Resolve the fresh review of brief 5.1, merge it, then the user's manual test of `knock doctor`.
+- Brief 5.2, FR-13 restore (`core-windows`); brief 5.3, diagnostics (`core-windows`, then `ui`); brief 5.4, the start-up rule and the deferred finding (5) messages.
 - Then: an error-handling survey, the health check screen polish (`ui`), and the §12.2 manual matrix for v0.9.
 Dependencies added: none
 Clarifications: none
 Open questions for the user:
-- Approval of ADRs 0037, 0038 and 0039. In 0037 the lead proposes that the escalation and stall clocks restart when Knock starts. In 0039 the lead added that an unfinished setup is offered again.
+- none
+- Reminder for the lead: when Copy diagnostics is merged, add the README privacy note (ADR 0038).
 
 ## 2026-11-06: Phase 4, public beta preparation
 Done:
