@@ -1,3 +1,15 @@
+# CI (SPEC.md §13.4, ADR 0040).
+#
+# Runs on every pull request: `pnpm check`, `pnpm art:check`, `cargo-deny`,
+# `pnpm audit`, the Windows build of the installer, and the smoke test.
+# Cheap checks come first, so a formatting or lint failure does not wait for
+# a build.
+#
+# `pnpm test:visual` is deliberately not here (ADR 0040): it compares
+# screenshots against the installed Edge, and the runner's Edge updates on
+# its own schedule, which would fail pull requests for reasons unrelated to
+# the change. The lead runs it locally before merging any UI or art change.
+
 name: CI
 
 on:
@@ -6,9 +18,14 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: pwsh
+
 jobs:
   check:
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -31,6 +48,10 @@ jobs:
       - name: Cargo.lock is up to date
         run: cargo fetch --locked --target x86_64-pc-windows-msvc
 
+      # §12.1 "Art" row: parts, pivots and clips valid. Seconds, so it runs
+      # before the slower checks.
+      - run: pnpm art:check
+
       - run: pnpm check
 
       # cargo-deny-action is a container action and cannot run on Windows runners.
@@ -40,3 +61,179 @@ jobs:
           cargo deny check
 
       - run: pnpm audit
+
+      # The build the smoke test drives. It must be a debug build:
+      # `GET /v1/debug/snapshot` exists in debug builds only (§8.1). A debug
+      # build also reads and writes only the Claude Code settings file named
+      # by KNOCK_CLAUDE_SETTINGS, which the smoke test leaves unset, so no
+      # real settings file can be touched (§8.2). `--no-bundle`: the
+      # installer is built from the release profile below; this step only
+      # needs the executable. Most of the debug dependency tree is already
+      # compiled by `cargo test` inside `pnpm check`.
+      - name: Build the app for the smoke test (debug)
+        run: pnpm exec tauri build --debug --no-bundle
+
+      # §12.1 "Smoke" row, as far as a runner with no interactive user can:
+      # launch the app, drive it with `knock sim` through the local server,
+      # and read the debug snapshot to confirm the engine saw the scenario.
+      # Installing the NSIS installer is not done here: nobody has verified
+      # how it behaves unattended, and a step that cannot be trusted is
+      # worse than one that is honestly absent (ADR 0040, §12.2 covers
+      # install, update and uninstall by hand).
+      #
+      # %APPDATA% points at a throwaway folder, so Knock's own files
+      # (server.json, settings.json, sessions.json) are written there and
+      # deleted again, and `knock sim` reads the port and token from the
+      # same file (§8.1). Nothing outside it is written.
+      - name: Smoke test (launch, knock sim, debug snapshot)
+        run: |
+          $appdata = Join-Path $env:RUNNER_TEMP 'knock-smoke'
+          if (Test-Path -LiteralPath $appdata) {
+            Remove-Item -LiteralPath $appdata -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $appdata | Out-Null
+          $env:APPDATA = $appdata
+          # A debug build edits only the file this names (§8.2): with it
+          # unset, Knock has no Claude Code settings file at all.
+          if (Test-Path env:KNOCK_CLAUDE_SETTINGS) {
+            Remove-Item env:KNOCK_CLAUDE_SETTINGS
+          }
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target/debug/knock-desktop.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            Write-Output "::error::The debug build is missing: target/debug/knock-desktop.exe"
+            exit 1
+          }
+
+          # A status code and body for any reply, including 401, on every
+          # PowerShell version: `Invoke-WebRequest` throws on 4xx unless the
+          # version happens to support -SkipHttpErrorCheck.
+          function Read-Knock($uri, $headers) {
+            try {
+              $r = Invoke-WebRequest -Uri $uri -Headers $headers -UseBasicParsing -TimeoutSec 5
+              return @{ code = [int]$r.StatusCode; body = [string]$r.Content }
+            } catch {
+              $response = $_.Exception.Response
+              if ($response -and $response.StatusCode) {
+                return @{ code = [int]$response.StatusCode; body = '' }
+              }
+              throw
+            }
+          }
+
+          $fail = $null
+          $app = Start-Process -FilePath $exe -PassThru
+          try {
+            # 1. It launches and picks a port and token (§8.1).
+            $file = Join-Path $appdata 'Knock\server.json'
+            $cfg = $null
+            foreach ($i in 1..60) {
+              if ($app.HasExited) {
+                throw "Knock exited with code $($app.ExitCode) before it started listening."
+              }
+              if (Test-Path -LiteralPath $file -PathType Leaf) {
+                try { $cfg = Get-Content -Raw -LiteralPath $file | ConvertFrom-Json }
+                catch { $cfg = $null }
+                if ($cfg -and $cfg.port -and $cfg.token) { break }
+              }
+              $cfg = $null
+              Start-Sleep -Seconds 1
+            }
+            if (-not $cfg) {
+              throw "Knock did not write a usable server.json within 60 s."
+            }
+            $base = "http://127.0.0.1:$($cfg.port)/v1"
+            # The token stays in this header: it is never printed (§11.5).
+            $auth = @{ 'X-Knock-Token' = $cfg.token }
+            Write-Output "Knock is listening on 127.0.0.1:$($cfg.port)"
+
+            # 2. Every request needs the token (§8.1, §11 rule 1).
+            $r = Read-Knock "$base/debug/snapshot" @{}
+            if ($r.code -ne 401) {
+              throw "A request without a token answered $($r.code), expected 401."
+            }
+
+            # 3. The health check answers (§8.1).
+            $health = $null
+            foreach ($i in 1..30) {
+              $r = Read-Knock "$base/health" $auth
+              if ($r.code -eq 200) {
+                $health = $r.body | ConvertFrom-Json
+                break
+              }
+              Start-Sleep -Seconds 1
+            }
+            if (-not $health) { throw "GET /v1/health never answered 200." }
+            Write-Output "Health: version $($health.version), $($health.sessionCount) sessions"
+
+            # 4. `knock sim` plays a §12.3 scenario against the running app,
+            #    with `X-Knock-Sim: 1` and the token from server.json.
+            #    `three-knocks`: three sessions with overlapping Needs-you
+            #    episodes, 28 s at real speed.
+            cargo run --locked -p knock-cli -- sim three-knocks
+            if ($LASTEXITCODE -ne 0) { throw "knock sim three-knocks failed." }
+
+            # 5. The engine saw it: the three sessions of that scenario, each
+            #    marked simulated (§8.1) and Ready after its Stop (§8.4), in
+            #    the debug snapshot.
+            $r = Read-Knock "$base/debug/snapshot" $auth
+            if ($r.code -ne 200) {
+              throw "GET /v1/debug/snapshot answered $($r.code), expected 200."
+            }
+            $snap = $r.body | ConvertFrom-Json
+            $ids = @($snap.sessions | ForEach-Object { $_.id } | Sort-Object)
+            if (($ids -join ',') -cne 's11,s12,s13') {
+              throw "The snapshot holds sessions '$($ids -join ',')', expected 's11,s12,s13'."
+            }
+            foreach ($s in $snap.sessions) {
+              if (-not $s.simulated) {
+                throw "Session $($s.id) is not marked simulated."
+              }
+              if ($s.tier -cne 'ready' -or $s.state -cne 'ready') {
+                throw "Session $($s.id) is $($s.tier)/$($s.state), expected ready/ready."
+              }
+            }
+            if ($snap.rev -lt 3) {
+              throw "The snapshot's rev is $($snap.rev): the engine published fewer than three changes."
+            }
+            Write-Output "Snapshot: rev $($snap.rev), sessions $($ids -join ', '), all simulated and Ready."
+          } catch {
+            $fail = $_.Exception.Message
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+            $app.WaitForExit(10000) | Out-Null
+          }
+
+          if ($fail) {
+            # Knock's own log, which by §11.5 holds no request bodies, tokens
+            # or full paths, so it is safe to show in the run log.
+            $logs = Join-Path $env:LOCALAPPDATA 'Knock\logs'
+            if (Test-Path -LiteralPath $logs) {
+              $newest = Get-ChildItem -LiteralPath $logs -Filter '*.log' -File |
+                Sort-Object LastWriteTime | Select-Object -Last 1
+              if ($newest) {
+                Write-Output "The last 60 lines of Knock's log:"
+                Get-Content -LiteralPath $newest.FullName -Tail 60
+              }
+            }
+            Write-Output "::error::Smoke test failed: $fail"
+            exit 1
+          }
+          Remove-Item -LiteralPath $appdata -Recurse -Force
+
+      # §13.3, §13.4: `tauri build`, the unsigned NSIS installer. Last,
+      # because it is the slowest step and shares nothing with the debug
+      # build above.
+      - name: Build the installer
+        run: pnpm build
+
+      - name: Check the installer was built
+        run: |
+          $dir = Join-Path $env:GITHUB_WORKSPACE 'target/release/bundle/nsis'
+          $found = @(Get-ChildItem -LiteralPath $dir -Filter '*-setup.exe' -File -ErrorAction SilentlyContinue)
+          if ($found.Count -ne 1) {
+            $seen = if ($found.Count -eq 0) { 'none' } else { ($found | ForEach-Object Name) -join ', ' }
+            Write-Output "::error::Expected exactly one installer in target/release/bundle/nsis, found: $seen"
+            exit 1
+          }
+          $mb = [math]::Round($found[0].Length / 1MB, 1)
+          Write-Output "Installer: $($found[0].Name) ($mb MB)"

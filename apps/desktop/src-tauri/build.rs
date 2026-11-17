@@ -16,6 +16,7 @@ const COMMANDS: &[&str] = &[
     "setup_apply_hooks",
     "setup_remove_hooks",
     "run_health_check",
+    "get_diagnostics",
     "play_test_knock",
     "repair_server",
 ];

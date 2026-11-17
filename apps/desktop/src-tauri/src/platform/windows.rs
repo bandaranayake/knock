@@ -1,6 +1,6 @@
 //! Windows implementation of [`Platform`]. All Win32 calls live here.
 
-use super::{Display, Monitor, Platform, RunOp, SignInChange, Taskbar, monitor_id};
+use super::{Display, Monitor, OsVersion, Platform, RunOp, SignInChange, Taskbar, monitor_id};
 use crate::jump::{self, Proc, ProcessId, Target, TcpRow, Win};
 use crate::strip::Rect;
 use windows::Win32::Foundation::{
@@ -21,8 +21,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_SZ, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
-    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ, RRF_NOEXPAND, RRF_RT_REG_DWORD,
+    RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
 };
 use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount64};
 use windows::Win32::System::Threading::{
@@ -213,6 +213,73 @@ fn restore_sign_in(setting: Option<bool>) -> std::io::Result<bool> {
     let ops = super::start_ops(setting, get_run_value()?.as_deref(), &own);
     apply_run_ops(ops, &own)?;
     Ok(!ops.is_empty())
+}
+
+/// Where Windows keeps its own version (read only, never written).
+const CURRENT_VERSION: PCWSTR = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+
+/// A string value under `key`, or `None` if it isn't there, isn't a string
+/// or is longer than the buffer (no version value is).
+fn reg_string(root: HKEY, key: PCWSTR, name: PCWSTR) -> Option<String> {
+    let mut buf = [0u16; 128];
+    let mut size = (buf.len() * 2) as u32;
+    // SAFETY: `buf` has `size` writable bytes; constant NUL-terminated names.
+    let r = unsafe {
+        RegGetValueW(
+            root,
+            key,
+            name,
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    (r == NO_ERROR)
+        .then(|| utf16(&buf))
+        .filter(|s| !s.is_empty())
+}
+
+/// A DWORD value under `key`, or `None` if it isn't there or isn't a DWORD.
+fn reg_u32(root: HKEY, key: PCWSTR, name: PCWSTR) -> Option<u32> {
+    let mut value = 0u32;
+    let mut size = 4u32;
+    // SAFETY: `value` is 4 writable bytes; constant NUL-terminated names.
+    let r = unsafe {
+        RegGetValueW(
+            root,
+            key,
+            name,
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut value).cast()),
+            Some(&mut size),
+        )
+    };
+    (r == NO_ERROR).then_some(value)
+}
+
+/// [`Platform::windows_version`] (ADR 0038): the build number, the update
+/// revision and the display version (like "25H2") as Windows records them,
+/// read from its own version key. Nothing identifying is read: not the
+/// edition, the owner, the install date or the machine id.
+fn windows_version() -> Option<OsVersion> {
+    let build: u32 = reg_string(
+        HKEY_LOCAL_MACHINE,
+        CURRENT_VERSION,
+        w!("CurrentBuildNumber"),
+    )
+    .and_then(|s| s.trim().parse().ok())?;
+    let revision = reg_u32(HKEY_LOCAL_MACHINE, CURRENT_VERSION, w!("UBR"));
+    Some(OsVersion {
+        name: super::windows_name(build),
+        version: reg_string(HKEY_LOCAL_MACHINE, CURRENT_VERSION, w!("DisplayVersion"))
+            .unwrap_or_default(),
+        build: match revision {
+            Some(r) => format!("{build}.{r}"),
+            None => build.to_string(),
+        },
+    })
 }
 
 /// AF_INET: the server listens on IPv4 loopback only.
@@ -647,6 +714,10 @@ impl Platform for WindowsPlatform {
     fn idle_ms(&self) -> Option<u64> {
         idle_ms()
     }
+
+    fn windows_version(&self) -> Option<OsVersion> {
+        windows_version()
+    }
 }
 
 #[cfg(test)]
@@ -667,6 +738,29 @@ mod tests {
                 .all(|m| m.width > 0 && m.height > 0 && !m.name.is_empty())
         );
         assert_eq!(a, monitors());
+    }
+
+    // Real OS calls (read only): this computer's Windows version, as ADR
+    // 0038 needs it. Holds nothing but the name, version and build, so it
+    // is safe to paste into a public bug report (§11 rule 8).
+    #[test]
+    fn the_windows_version_of_this_machine() {
+        let v = windows_version().expect("Windows records its own build number");
+        assert!(["Windows 11", "Windows 10"].contains(&v.name), "{v:?}");
+        let (build, revision) = match v.build.split_once('.') {
+            Some((b, r)) => (b, Some(r)),
+            None => (v.build.as_str(), None),
+        };
+        assert!(build.parse::<u32>().unwrap() >= 10_000, "{v:?}");
+        assert!(revision.is_none_or(|r| r.parse::<u32>().is_ok()), "{v:?}");
+        // "25H2" and the like, or empty on a Windows that doesn't say.
+        assert!(v.version.chars().all(char::is_alphanumeric), "{v:?}");
+        assert!(!v.version.contains(' '), "{v:?}");
+        assert_eq!(Some(&v), windows_version().as_ref(), "stable");
+        // No path, and nothing about this user or machine (§11 rule 5).
+        for s in [v.name.to_string(), v.version, v.build] {
+            assert!(!s.contains('\\') && !s.contains('/'), "{s}");
+        }
     }
 
     /// `reg query` output for `HKCU\<key>`, value `Knock`; `None` if absent.
