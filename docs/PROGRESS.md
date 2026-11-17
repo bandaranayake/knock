@@ -43,8 +43,14 @@ Done:
     - Lead note sent: the ADR 0019 test assertion "an episode always waits on at least one requester" must hold across a restore (counting the unknown requester), not be deleted.
   - Brief 5.3 (`ui`), the UI side of ADR 0038: the version line and the **Copy diagnostics** button, built against the dev mock. The core side of `get_diagnostics()` is a later brief.
 - Lead survey of the deferred finding (5): all three misleading messages are core-side strings (`hooks.rs` `NoServer`, `main.rs` `CANT_START` and the health check's server detail). The one about "Choose Repair" with no button is the setup Connect screen, which shows the `NoServer` text while only Settings has a Repair button. They go in brief 5.4 with ADR 0039, after 5.2 merges, because they share `src-tauri` paths.
+- Brief 5.3 (`ui`) done and committed (df2a99a): the version line and **Copy diagnostics** in Settings, against the dev mock. Lead review passed; 139 Vitest and 88 settings screenshot tests pass, Biome clean, scope clean. Not user-testable until the core side exists.
+  - Deviations accepted by the lead: two short sentences instead of one beside the button; "Copied" clears after 8 s so the screenshot test doesn't flake; a `diagnostics.ts` module, since Vitest here tests pure logic and Playwright tests rendering.
+- Lead found: `pnpm test:visual` had 5 failing overlay screenshots (13-122 px, threshold 10), caused by an Edge update, not by any change: nothing in `overlay/` or `art/` had changed since the baselines of 2026-11-04 (1ff0a25). The lead opened the `icons` diff image and saw only anti-aliasing on edges. Brief 5.5 sent to `ui` to confirm each diff and regenerate only those five.
+- Lead found: `.github/workflows/ci.yml` runs only `pnpm check`, `cargo fetch --locked`, `cargo-deny` and `pnpm audit`. §13.4 also lists `pnpm test:visual`, `pnpm art:check`, a Windows build and a smoke test; none of them has ever run on GitHub.
+  - **ADR 0040, approved by the user on 2026-11-17:** CI gains `art:check`, the Windows build and the smoke test. `pnpm test:visual` stays local, run by the lead before merging any UI or art change, with the anti-aliasing check before any baseline is regenerated. The threshold stays at 10. SPEC.md §13.4 amended.
 Next:
-- Review and merge briefs 5.2 and 5.3, then brief 5.4: the core side of `get_diagnostics()`, the ADR 0039 start-up rule, and the finding (5) messages.
+- Review and merge briefs 5.2 and 5.5, then brief 5.4: the core side of `get_diagnostics()`, the ADR 0039 start-up rule, and the finding (5) messages.
+- Brief 5.6 (`core-windows`, `.github/`): make `ci.yml` match the amended §13.4 (ADR 0040).
 - Then: an error-handling survey, the README privacy note for Copy diagnostics (ADR 0038), and the §12.2 manual matrix for v0.9.
 Dependencies added: none
 Clarifications: none
