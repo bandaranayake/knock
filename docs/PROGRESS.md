@@ -27,6 +27,12 @@ Done:
 - Brief 5.1 done (475a1a7): `knock doctor`, read-only, std only. Lead review passed; `pnpm check` passes. The fresh review is running; not merged yet.
   - Lead fix: `.claude/settings.local.json` added to `.gitignore`, because Biome failed on it (1f93bf0).
   - Clarifications (lead): doctor always reads the real §8.2 file, also in debug builds, since it only reads. It does not detect a hard-linked settings file (ADR 0024); std can't read a link count.
+- Fresh review of 475a1a7 (ADR 0029): no serious findings and no §8.1, §8.2 or §11 violation. Four minor ones, verified by the lead:
+  - (1) "Listening" passed on any `200`, even from another program on Knock's port. Real; fixed by `core-windows` (follow-up brief 5.1a): only Knock's own §8.1 health reply passes. Lead review passed; `pnpm check` passes. Merged into `develop`.
+  - **Accepted by the user as known limits (2026-11-17):**
+    - (2) Doctor does not detect a hard-linked settings file.
+    - (3) Doctor ignores `KNOCK_CLAUDE_SETTINGS`, so it can disagree with a development build.
+    - (4) Doctor uses the terminal's `CLAUDE_CONFIG_DIR`, which can differ from the running app's.
 - Three ADRs written and **approved by the user on 2026-11-17**. SPEC.md §8.4, §8.5 and §10.4 were updated. The user's choices are recorded in them:
   - ADR 0037, restoring sessions after a restart: a Needs-you session knocks again with no second notification; a session whose program is gone shows "Session ended".
   - ADR 0038, a `get_diagnostics()` command: Settings shows the version and gets a **Copy diagnostics** button.
