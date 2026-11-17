@@ -102,8 +102,14 @@ Done:
 - **ADR 0042, approved by the user on 2026-11-18:** v0.9 is downloaded from a GitHub pre-release, not auto-updated. §13.5 said "via auto-update" although no updater, `latest.json` or updater key exists and §14 puts all three in Phase 6. SPEC.md §13.5 amended.
 - The §12.2 release matrix was written and given to the user as six standalone tests (fresh install and setup; terminals and jumping; display scaling; taskbar and monitors; Do Not Disturb and animation effects; upgrade and uninstall), about 90 minutes in total. It includes the one thing no automated test can prove: that a built app's Settings window may actually invoke `get_diagnostics` (the ACL fix of brief 5.4a).
 - Four spec-versus-reality gaps were closed this session: CI checks that never ran (ADR 0040), a `nightly.yml` that never existed (ADR 0041), a v0.9 auto-update that cannot happen (ADR 0042), and visual baselines that compared against invented wording (briefs 5.8, 5.9).
+- Version bumped to **0.9.0** (8724947): `apps/desktop/src-tauri/Cargo.toml` (the single source `release.yml` reads via `cargo metadata`), `Cargo.lock`, the README's installer name and both issue templates' placeholders. Release notes written at `docs/releases/v0.9.0.md`, which `release.yml` picks up. `cargo fetch --locked` verified, since a stale lock file fails CI.
+- **First pull request on the new CI failed at `pnpm audit`** (2026-11-18): GHSA-fc5q-39xc-vjpf, picomatch ReDoS, high.
+  - Lead's findings: no fixed version exists (`npm view picomatch version` → 4.0.7; the advisory names 4.0.8, never published), it reaches the tree only through `vite` as a dev dependency across 12 paths, it is absent from `apps/desktop/ui/dist` and so from the installer, and the only glob patterns it sees are this repository's own.
+  - **ADR 0043, approved by the user on 2026-11-18:** ignore that one advisory by id until a fix ships.
+  - The setting had to go in `pnpm-workspace.yaml`, not `package.json`: pnpm 11 warns that "the `pnpm` field in package.json is no longer read". The lead found this by checking the real exit code — the first two attempts looked plausible but still exited 1.
+  - `pnpm audit` now exits 0 and still prints "1 high (1 ignored)", so the finding stays visible, and it still fails on anything else.
 Next:
-- Bump the version to 0.9.0 when the user is ready to build, then the user runs the §12.2 matrix.
+- The user builds 0.9.0 (`pnpm build`) and runs the §12.2 matrix.
 - When it passes: Phase 5 ends, the user publishes v0.9 as a pre-release (unsigned installer, Smart App Control, §13.5), then Phase 6 (ship): `release.yml` tag trigger, updater, `latest.json`, landing page, demo recording, and Gate G3.
 - Then: the README privacy note (ADR 0038), the dev-mock alignment, and the §12.2 manual matrix for v0.9.
 - Then: an error-handling survey, the README privacy note (ADR 0038), and the §12.2 manual matrix for v0.9.
