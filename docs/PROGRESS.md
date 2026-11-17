@@ -16,6 +16,37 @@ Open questions for the user:
 
 ---
 
+## 2026-11-17: Phase 5 (hardening) started
+Done:
+- **Gate G2 passed** (user decision, 2026-11-17). Phase 4 is closed.
+- Local `develop` fast-forwarded to `origin/develop` (it was 9 commits behind).
+- Survey by the lead of what Phase 5 needs:
+  - Already built: the health check command and its screen in Settings (FR-12, Phase 2); `ended_unexpectedly` and the `crash` scenario.
+  - Not built: `knock doctor` (only named in the usage text); restoring `sessions.json` at start (FR-13; the file is written but never read); the **Copy diagnostics** button (§11 rule 8).
+- Brief 5.1 sent to `core-windows` on `phase-5/doctor`: `knock doctor`, read-only, inside `crates/knock-cli/`.
+- Brief 5.1 done (475a1a7): `knock doctor`, read-only, std only. Lead review passed; `pnpm check` passes. The fresh review is running; not merged yet.
+  - Lead fix: `.claude/settings.local.json` added to `.gitignore`, because Biome failed on it (1f93bf0).
+  - Clarifications (lead): doctor always reads the real §8.2 file, also in debug builds, since it only reads. It does not detect a hard-linked settings file (ADR 0024); std can't read a link count.
+- Fresh review of 475a1a7 (ADR 0029): no serious findings and no §8.1, §8.2 or §11 violation. Four minor ones, verified by the lead:
+  - (1) "Listening" passed on any `200`, even from another program on Knock's port. Real; fixed by `core-windows` (follow-up brief 5.1a): only Knock's own §8.1 health reply passes. Lead review passed; `pnpm check` passes. Merged into `develop`.
+  - **Accepted by the user as known limits (2026-11-17):**
+    - (2) Doctor does not detect a hard-linked settings file.
+    - (3) Doctor ignores `KNOCK_CLAUDE_SETTINGS`, so it can disagree with a development build.
+    - (4) Doctor uses the terminal's `CLAUDE_CONFIG_DIR`, which can differ from the running app's.
+- Three ADRs written and **approved by the user on 2026-11-17**. SPEC.md §8.4, §8.5 and §10.4 were updated. The user's choices are recorded in them:
+  - ADR 0037, restoring sessions after a restart: a Needs-you session knocks again with no second notification; a session whose program is gone shows "Session ended".
+  - ADR 0038, a `get_diagnostics()` command: Settings shows the version and gets a **Copy diagnostics** button.
+  - ADR 0039, deferred finding (4): setup opens by itself only until it has been finished once.
+Next:
+- Resolve the fresh review of brief 5.1, merge it, then the user's manual test of `knock doctor`.
+- Brief 5.2, FR-13 restore (`core-windows`); brief 5.3, diagnostics (`core-windows`, then `ui`); brief 5.4, the start-up rule and the deferred finding (5) messages.
+- Then: an error-handling survey, the health check screen polish (`ui`), and the §12.2 manual matrix for v0.9.
+Dependencies added: none
+Clarifications: none
+Open questions for the user:
+- none
+- Reminder for the lead: when Copy diagnostics is merged, add the README privacy note (ADR 0038).
+
 ## 2026-11-06: Phase 4, public beta preparation
 Done:
 - ADR 0035 (approved by the user): v0.3 is a **public** beta via a GitHub pre-release, and the user judges G2 from setup reports. SPEC.md §13.5 and §14 were updated.
@@ -43,7 +74,6 @@ Done:
   - Setup works.
 - README badges, added by the user: the beta badge works. The shields.io license badge showed "repo not found", a stale cache from when the repo was private (GitHub's API reports MIT). The user chose to leave it as is.
 Next:
-- Gate G2: the user judges it from setup reports.
 - Gate G2: the user judges it from setup reports.
 Dependencies added: none
 Clarifications: none

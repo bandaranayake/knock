@@ -321,6 +321,15 @@ The adapter MUST read only the allow-listed fields (`session_id`, `cwd`, `hook_e
 - A session with no events and no live process for 6 hours is removed. A session whose process was never found counts as having no live process (ADR 0018).
 - Any (state, input) pair not listed above leaves the session unchanged (ADR 0018).
 
+**Restore (FR-13, ADR 0037):**
+
+- At start the app loads the saved snapshot and re-checks each session's process. Simulated sessions are never restored.
+- A session comes back in its saved state, with its animal and its time in state. A `needs_input` episode is the same episode: seen stays seen, and no second `Notify` is sent.
+- A session whose process is gone follows the "Process gone" row above.
+- The escalation and stall clocks restart at start-up. The 6-hour removal rule uses the saved time of the last event.
+- For a restored episode, the first `activity` from any agent closes it.
+- Restoring emits no `Notify`, `Escalate` or `ReadyBatchAdd`. A missing or invalid snapshot means no sessions.
+
 **Deduplication:** a `PermissionRequest` and a `permission_prompt` notification for the same session within 10 s are one episode, with one `Notify`, even if the episode closed in between (ADR 0010). Dedup is per requester (ADR 0019); a prompt without `agentId` matches any requester's request in the last 10 s (ADR 0021). An episode's `needs.kind` is set by the event that opened it.
 
 **Effects:**
@@ -388,6 +397,7 @@ The adapter MUST read only the allow-listed fields (`session_id`, `cwd`, `hook_e
 | `setup_apply_hooks()`, `setup_remove_hooks()` | Write or remove hooks (§8.2)                                                            |
 | `run_health_check()`                          | Returns the checks and their results in plain language                                  |
 | `play_test_knock()`                           | Runs a simulated knock so the user sees what it looks like                              |
+| `get_diagnostics()`                           | Returns `{ version, text }`: the version for Settings, and the text **Copy diagnostics** copies (§11 rule 8, ADR 0038) |
 
 Names are the initial contract; changing them requires an ADR.
 
@@ -593,7 +603,7 @@ Screens in order:
 5. Test knock.
 6. Done.
 
-Every screen uses plain words, explains why, and offers Back. Setup can be reopened from Settings. **Remove Knock from Claude Code** is always one click away in Settings.
+Every screen uses plain words, explains why, and offers Back. Setup opens by itself at start only until the user has answered step 4 once (ADR 0039). Setup can be reopened from Settings. **Remove Knock from Claude Code** is always one click away in Settings.
 
 ### 10.5 Accessibility
 
