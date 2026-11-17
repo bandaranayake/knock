@@ -113,15 +113,7 @@ pub fn listen(dir: &Path) -> Result<(ServerConfig, TcpListener), StartError> {
             let token = ServerConfig::generate()
                 .map_err(StartError::at(Step::Other))?
                 .token;
-            // [`pick`] gives AddrInUse only from [`no_free_port`]; anything
-            // else came from the random source inside it.
-            let (cfg, listener) = pick(token, None).map_err(|e| StartError {
-                step: match e.kind() {
-                    io::ErrorKind::AddrInUse => Step::Bind,
-                    _ => Step::Other,
-                },
-                error: e,
-            })?;
+            let (cfg, listener) = pick(token, None).map_err(picking)?;
             save(dir, &cfg).map_err(StartError::at(Step::Save))?;
             Ok((cfg, listener))
         }
@@ -141,21 +133,29 @@ pub fn listen(dir: &Path) -> Result<(ServerConfig, TcpListener), StartError> {
 /// keep); `start`s the server there; and only then saves `server.json`,
 /// atomically. If binding or `start` fails, `server.json` is as it was. If
 /// saving fails, `start`'s result is dropped (for a server, its stop
-/// sender, so it stops) and `server.json` is as it was.
+/// sender, so it stops) and `server.json` is as it was. Each error says
+/// which step failed, as [`listen`]'s does, so [`repair_failed`] can say
+/// something true about it.
 pub fn repair<T>(
     dir: &Path,
     start: impl FnOnce(&ServerConfig, TcpListener) -> io::Result<T>,
-) -> io::Result<(ServerConfig, T)> {
+) -> Result<(ServerConfig, T), StartError> {
+    // A missing or invalid old file is no error here: Repair writes a new
+    // one. So Repair never reports [`Step::Config`].
     let old = std::fs::read(dir.join("server.json"))
         .ok()
         .and_then(|b| parse_config(&b).ok());
     let token = match &old {
         Some(c) => c.token.clone(),
-        None => ServerConfig::generate()?.token,
+        None => {
+            ServerConfig::generate()
+                .map_err(StartError::at(Step::Other))?
+                .token
+        }
     };
-    let (cfg, listener) = pick(token, old.map(|c| c.port))?;
-    let started = start(&cfg, listener)?;
-    save(dir, &cfg)?;
+    let (cfg, listener) = pick(token, old.map(|c| c.port)).map_err(picking)?;
+    let started = start(&cfg, listener).map_err(StartError::at(Step::Other))?;
+    save(dir, &cfg).map_err(StartError::at(Step::Save))?;
     Ok((cfg, started))
 }
 
@@ -178,16 +178,40 @@ fn no_free_port() -> io::Error {
     io::Error::new(io::ErrorKind::AddrInUse, "no free port found")
 }
 
-/// Repair's `{ ok: false, message }` text for its error (§6 plain language).
-/// Only "no free port" ([`pick`]'s AddrInUse) asks for a restart, since
-/// Windows may free reserved ports then; any other step that failed changed
-/// nothing and can simply be retried (ADR 0023).
-pub fn repair_failed(e: &io::Error) -> &'static str {
-    match e.kind() {
-        io::ErrorKind::AddrInUse => {
+/// A [`pick`] failure as a step: AddrInUse comes only from
+/// [`no_free_port`], so anything else came from the random source inside it.
+fn picking(e: io::Error) -> StartError {
+    StartError {
+        step: match e.kind() {
+            io::ErrorKind::AddrInUse => Step::Bind,
+            _ => Step::Other,
+        },
+        error: e,
+    }
+}
+
+/// Repair's `{ ok: false, message }` text for its error (§6 plain language,
+/// ADR 0023). The [`Step`] that failed decides, as for [`start_failed`]:
+///
+/// - [`Step::Bind`]: no free port in 50 tries. Trying again can genuinely
+///   help, since another port may be free, and a restart may free the ports
+///   Hyper-V, WSL2 or Docker reserved.
+/// - [`Step::Save`]: a port was found, so nothing is using anything, but
+///   Knock couldn't write its own file. Pressing Repair again fails at the
+///   same step, so the text says so and names what the user can really do.
+/// - [`Step::Other`]: the step changed nothing and can simply be retried.
+///   [`Step::Config`] never comes from [`repair`], and reads the same way.
+pub fn repair_failed(e: &StartError) -> &'static str {
+    match e.step {
+        Step::Bind => {
             "Knock couldn't find a free connection to listen on. Please restart your computer, then try Repair again."
         }
-        _ => "Knock couldn't set up a new connection, so nothing changed. Please try Repair again.",
+        Step::Save => {
+            "Knock couldn't save its own connection file, so nothing changed. Something is stopping Knock from writing in its own folder, often security software, and trying again won't help until that is fixed. Please allow Knock in your security software, or restart your computer, then start Knock again."
+        }
+        Step::Other | Step::Config => {
+            "Knock couldn't set up a new connection, so nothing changed. Please try Repair again."
+        }
     }
 }
 
@@ -1177,7 +1201,8 @@ mod tests {
         // Starting fails: nothing saved, and the error comes back.
         let refused = || Err::<(), _>(io::Error::other("refused"));
         let e = repair(&dir, |_, _| refused()).unwrap_err();
-        assert_eq!(e.to_string(), "refused");
+        assert_eq!(e.error.to_string(), "refused");
+        assert_eq!(e.step, Step::Other, "the server task, not a step of ours");
         assert_eq!(std::fs::read(&file).unwrap(), before);
         // While the server starts, the old file is still there.
         let (cfg, seen) = repair(&dir, |cfg, l| {
@@ -1196,17 +1221,40 @@ mod tests {
         let e = repair(&dir, |_, _| Ok(stop)).unwrap_err();
         let retry =
             "Knock couldn't set up a new connection, so nothing changed. Please try Repair again.";
-        assert_eq!(repair_failed(&e), retry);
-        // Only "no free port" asks for a restart.
-        let restart = "Knock couldn't find a free connection to listen on. Please restart your computer, then try Repair again.";
-        assert_eq!(repair_failed(&no_free_port()), restart);
-        assert_eq!(repair_failed(&io::Error::other("refused")), retry);
+        // A port was found, so nothing is using anything, and pressing
+        // Repair again fails at the same step: it used to read `retry`,
+        // which sent the user round that loop for ever (brief 5.4b).
+        let unwritable = "Knock couldn't save its own connection file, so nothing changed. Something is stopping Knock from writing in its own folder, often security software, and trying again won't help until that is fixed. Please allow Knock in your security software, or restart your computer, then start Knock again.";
+        assert_eq!(e.step, Step::Save, "{e:?}");
+        assert_eq!(repair_failed(&e), unwritable);
+        assert!(!unwritable.contains("Repair again"), "no Repair loop");
         assert_eq!(
             stopped.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Closed)
         );
         assert!(dir.join("server.json").is_dir());
         assert!(!dir.join("server.json.tmp").exists());
+        // The other way a save fails: the temporary file can't be created.
+        let tmp = temp_dir("repair-tmp-fails");
+        std::fs::create_dir(tmp.join("server.json.tmp")).unwrap();
+        let e = repair(&tmp, |_, l| Ok(l)).unwrap_err();
+        assert_eq!(e.step, Step::Save, "{e:?}");
+        assert_eq!(repair_failed(&e), unwritable);
+        assert!(!tmp.join("server.json").exists(), "nothing saved");
+        // Only "no free port" asks for a restart and is worth retrying,
+        // since another port may be free next time.
+        let restart = "Knock couldn't find a free connection to listen on. Please restart your computer, then try Repair again.";
+        let no_port = picking(no_free_port());
+        assert_eq!(no_port.step, Step::Bind);
+        assert_eq!(repair_failed(&no_port), restart);
+        // Anything else changed nothing and can simply be retried.
+        assert_eq!(repair_failed(&io::Error::other("refused").into()), retry);
+        // The texts hold no path, no port and no token (§11.5).
+        for m in [retry, unwritable, restart] {
+            assert!(!m.contains('\\') && !m.contains('/'), "{m}");
+            assert!(!m.contains(&cfg.port.to_string()) && !m.contains(&cfg.token));
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(file.parent().unwrap()).unwrap();
     }
@@ -1215,7 +1263,11 @@ mod tests {
     fn repair_without_a_valid_server_json_makes_a_new_token() {
         let dir = temp_dir("repair-invalid");
         std::fs::write(dir.join("server.json"), b"{ not json").unwrap();
-        assert_eq!(listen(&dir).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let e = listen(&dir).unwrap_err();
+        assert_eq!(
+            (e.step, e.kind()),
+            (Step::Config, io::ErrorKind::InvalidData)
+        );
         let (cfg, _l) = repair(&dir, |_, l| Ok(l)).unwrap();
         let saved = parse_config(&std::fs::read(dir.join("server.json")).unwrap()).unwrap();
         assert_eq!(saved, cfg);

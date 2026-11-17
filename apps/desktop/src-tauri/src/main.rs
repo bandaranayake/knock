@@ -266,7 +266,7 @@ async fn repair_server(app: AppHandle, k: tauri::State<'_, Knock>) -> Result<Val
             json!({ "ok": true })
         }
         Err(e) => {
-            tracing::warn!(kind = ?e.kind(), "server not repaired");
+            tracing::warn!(step = ?e.step, kind = ?e.kind(), "server not repaired");
             json!({ "ok": false, "message": server::repair_failed(&e) })
         }
     })
