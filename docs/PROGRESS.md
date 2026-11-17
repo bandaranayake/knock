@@ -37,10 +37,15 @@ Done:
   - ADR 0037, restoring sessions after a restart: a Needs-you session knocks again with no second notification; a session whose program is gone shows "Session ended".
   - ADR 0038, a `get_diagnostics()` command: Settings shows the version and gets a **Copy diagnostics** button.
   - ADR 0039, deferred finding (4): setup opens by itself only until it has been finished once.
+- `phase-5/doctor` merged into `develop` (ea92203). Manual test for `knock doctor` given to the user; result not in yet.
+- Branch `phase-5/restore` created from `develop`. Two briefs are in flight on it:
+  - Brief 5.2 (`core-windows`), FR-13 restore. The agent stopped once on a usage limit and was resumed; `knock-core` has `Engine::restore`, `Saved`, `SavedNeeds`, `Liveness` and `RestoreError`, and the app-shell side is still to come.
+    - Lead note sent: the ADR 0019 test assertion "an episode always waits on at least one requester" must hold across a restore (counting the unknown requester), not be deleted.
+  - Brief 5.3 (`ui`), the UI side of ADR 0038: the version line and the **Copy diagnostics** button, built against the dev mock. The core side of `get_diagnostics()` is a later brief.
+- Lead survey of the deferred finding (5): all three misleading messages are core-side strings (`hooks.rs` `NoServer`, `main.rs` `CANT_START` and the health check's server detail). The one about "Choose Repair" with no button is the setup Connect screen, which shows the `NoServer` text while only Settings has a Repair button. They go in brief 5.4 with ADR 0039, after 5.2 merges, because they share `src-tauri` paths.
 Next:
-- Resolve the fresh review of brief 5.1, merge it, then the user's manual test of `knock doctor`.
-- Brief 5.2, FR-13 restore (`core-windows`); brief 5.3, diagnostics (`core-windows`, then `ui`); brief 5.4, the start-up rule and the deferred finding (5) messages.
-- Then: an error-handling survey, the health check screen polish (`ui`), and the §12.2 manual matrix for v0.9.
+- Review and merge briefs 5.2 and 5.3, then brief 5.4: the core side of `get_diagnostics()`, the ADR 0039 start-up rule, and the finding (5) messages.
+- Then: an error-handling survey, the README privacy note for Copy diagnostics (ADR 0038), and the §12.2 manual matrix for v0.9.
 Dependencies added: none
 Clarifications: none
 Open questions for the user:
