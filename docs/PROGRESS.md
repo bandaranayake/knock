@@ -65,8 +65,16 @@ Done:
   - Not changed: `project`, `projectKey` and `animal` are read unchecked. Robustness only, nothing leaves the machine, and the overlay falls back to the fox.
 - Brief 5.5 (`ui`) done and committed (0048226): four overlay baselines regenerated after each diff was confirmed to be anti-aliasing only (13-53 px; same text, layout, poses, badges).
   - The fifth was **refused**, correctly: `animals-stepping-down` is not drift but a flaky mid-animation capture — the fox one pixel lower, 122 px, intermittent. The lead reproduced it: 1 pass, 3 failures in four runs, identical every time. It has been unreliable since it was written and would fail at random on any machine; ADR 0040 makes that a merge blocker. Brief 5.7 sent to `ui` to fix the timing at its source, with 12 consecutive passes required as evidence. Loosening the threshold, a retry, a mask or a sleep are all ruled out.
+- Brief 5.2a done (ca2ffaf): all three findings fixed and verified by the lead. `turn.completed` passes `stand_in: false` to `remove()`, so only `activity` may stand in for the unknown requester; `Session::gone(now, gone_since)` separates the fade clock from the 6-hour clock; `last_event_at` is seeded from the restored sessions. New test `a_subagents_knock_survives_a_restart_and_the_main_agents_stop` builds the review's scenario through a real save and restore.
+  - Consequence pinned by the fix: a session found gone whose saved last event is already over 6 h old is dropped at restore instead of fading for 60 s. That is what §8.4 asks for.
+- Brief 5.7 done (0cc31cc): the flaky step-down capture is fixed at its source. Playwright's fake clock puts animation frames on a 16 ms grid whose phase carries a few ms of real time, so the capture landed anywhere in a 32 ms window. A repeated `sessions-changed` restarts nothing and draws one more frame at exactly the clock's reading. 18 consecutive passes (12 by the agent, 6 by the lead) against 1 in 4 before. The threshold stays at 10; no tolerance, retry, mask or sleep.
+  - `ui` noted that `animals-knocking`, `animals-den-step-out` and the looping states are stable only because their instants sit where ±32 ms is sub-pixel. If one starts flaking, the same pinning fixes it.
+- **`phase-5/restore` merged into `develop` (fee183d).** Lead's full run before the merge, per ADR 0040: `pnpm check` passes (144 desktop, 30 restore, 44 engine, 2 invariants, 49 CLI, 139 Vitest), `pnpm test:visual` 225 passed 0 failed, `pnpm art:check` passes.
 Next:
-- Review brief 5.2a and brief 5.7, then merge `phase-5/restore` and give the user the manual test for restart recovery.
+- The user's manual test of restart recovery.
+- Brief 5.4 (`core-windows`): the core side of `get_diagnostics()` (ADR 0038), the ADR 0039 start-up rule, and the finding (5) messages.
+- Brief 5.6 (`core-windows`, `.github/`): make `ci.yml` match the amended §13.4 (ADR 0040).
+- Then: an error-handling survey, the README privacy note (ADR 0038), and the §12.2 manual matrix for v0.9.
 - Brief 5.4: the core side of `get_diagnostics()`, the ADR 0039 start-up rule, the restored last-event time, and the finding (5) messages.
 - Brief 5.6 (`core-windows`, `.github/`): make `ci.yml` match the amended §13.4 (ADR 0040).
 - Then: an error-handling survey, the README privacy note for Copy diagnostics (ADR 0038), and the §12.2 manual matrix for v0.9.
