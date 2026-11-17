@@ -240,6 +240,25 @@ mod doctor {
         let out = home.doctor();
         assert_eq!(out.status.code(), Some(1));
         assert!(stdout_lines(&out)[1].starts_with("FAIL  Listening for Claude Code: "));
+        // Another program on Knock's port answers 200, but not Knock's reply.
+        let home = Home::new("foreign");
+        let port = stand_in("200 OK", "<html>It works!</html>".into());
+        home.server(port);
+        home.installed(port);
+        let out = home.doctor();
+        assert_eq!(out.status.code(), Some(1));
+        let lines = stdout_lines(&out);
+        assert_eq!(lines.len(), 3, "no info line: {lines:?}");
+        assert_eq!(
+            lines[1],
+            "FAIL  Listening for Claude Code: Something other than Knock answered on Knock's \
+             connection. Open Knock's Settings and choose Repair."
+        );
+        assert_eq!(
+            lines[2],
+            "FAIL  Last event from Claude Code: Knock couldn't check this, because it isn't \
+             listening for Claude Code."
+        );
     }
 }
 

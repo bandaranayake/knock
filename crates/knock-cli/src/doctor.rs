@@ -198,7 +198,8 @@ enum Hooks {
     Missing,
 }
 
-/// Why the settings file couldn't be checked. Messages are hooks.rs:67-75.
+/// Why the settings file couldn't be checked. The cases are hooks.rs:67-75;
+/// the wording is doctor's own, since doctor never changes the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Problem {
     Unreadable,
@@ -210,13 +211,13 @@ impl Problem {
     fn message(self) -> &'static str {
         match self {
             Self::Unreadable => {
-                "Knock couldn't open your Claude Code settings file, so it didn't change anything. Please try again."
+                "Knock couldn't open your Claude Code settings file, so it couldn't check this. Please run this again."
             }
             Self::NotJson => {
-                "Your Claude Code settings file isn't valid JSON, so Knock didn't change it. Please fix the file, or ask for help, then try again."
+                "Your Claude Code settings file isn't valid JSON, so Knock can't read it. Fix the file, or ask for help, then run this again."
             }
             Self::Shape => {
-                "Your Claude Code settings file is laid out in a way Knock doesn't recognise, so Knock didn't change it."
+                "Your Claude Code settings file is laid out in a way Knock doesn't recognise, so Knock can't check it. Ask for help, then run this again."
             }
         }
     }
@@ -473,14 +474,27 @@ fn status(raw: Option<&[u8]>, spec: &HookSpec, port: u16, token: &str) -> Result
 /// What `GET /v1/health` got.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Reply {
-    /// `200`, with the body.
-    Ok(Vec<u8>),
+    /// `200` with Knock's health reply (always [`is_health`]).
+    Ok(Value),
     /// Nothing answered.
     NoAnswer,
     /// `401`: the token wasn't accepted.
     Unauthorized,
-    /// Some other status, or not HTTP.
+    /// Some other status, a `200` that isn't Knock's health reply (another
+    /// program on Knock's port, ADR 0023), or not HTTP.
     Other,
+}
+
+/// Knock's §8.1 health reply, as server.rs:393-402 (`health`) builds it: a
+/// JSON object with a string `version`, numbers `uptimeS` and
+/// `sessionCount`, and `lastEventAt` a string or null.
+fn is_health(v: &Value) -> bool {
+    let has = |k: &str, kind: fn(&Value) -> bool| v.get(k).is_some_and(kind);
+    v.is_object()
+        && has("version", Value::is_string)
+        && has("uptimeS", Value::is_number)
+        && has("sessionCount", Value::is_number)
+        && has("lastEventAt", |x| x.is_string() || x.is_null())
 }
 
 /// One `GET /v1/health` to 127.0.0.1:`port` (loopback only) with the token,
@@ -512,9 +526,11 @@ fn get_health(port: u16, token: &str, timeout: Duration) -> Reply {
         .and_then(|c| std::str::from_utf8(c).ok());
     match code {
         Some("200") => {
-            let body = (raw.windows(4).position(|w| w == b"\r\n\r\n"))
-                .map_or(Vec::new(), |i| raw[i + 4..].to_vec());
-            Reply::Ok(body)
+            let body = (raw.windows(4).position(|w| w == b"\r\n\r\n")).map(|i| &raw[i + 4..]);
+            match body.and_then(|b| serde_json::from_slice::<Value>(b).ok()) {
+                Some(v) if is_health(&v) => Reply::Ok(v),
+                _ => Reply::Other,
+            }
         }
         Some("401") => Reply::Unauthorized,
         _ => Reply::Other,
@@ -554,10 +570,9 @@ fn server_check(conn: &Conn, reply: Option<&Reply>) -> Check {
     }
 }
 
-/// `lastEventAt` from a health body: `Ok(None)` if Knock hasn't heard from
-/// Claude Code since it started; `Err` if the body doesn't say.
-fn last_event(body: &[u8]) -> Result<Option<u64>, ()> {
-    let v: Value = serde_json::from_slice(body).map_err(|_| ())?;
+/// `lastEventAt` from a health reply: `Ok(None)` if Knock hasn't heard from
+/// Claude Code since it started; `Err` if it isn't a time Knock writes.
+fn last_event(v: &Value) -> Result<Option<u64>, ()> {
     match v.get("lastEventAt").ok_or(())? {
         Value::Null => Ok(None),
         Value::String(s) => parse_iso(s).map(Some).ok_or(()),
@@ -600,8 +615,7 @@ fn last_check(reply: Option<&Reply>, now_ms: u64) -> Check {
 /// version made of version characters is shown, so nothing else from the
 /// reply can reach the output.
 fn info(reply: &Reply) -> Option<String> {
-    let Reply::Ok(body) = reply else { return None };
-    let v: Value = serde_json::from_slice(body).ok()?;
+    let Reply::Ok(v) = reply else { return None };
     let version = v.get("version")?.as_str()?;
     let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+');
     if version.is_empty() || version.len() > 40 || !version.chars().all(plain) {
@@ -937,8 +951,8 @@ mod tests {
 
     #[test]
     fn invalid_json_fails_with_a_plain_explanation() {
-        let not_json = "Your Claude Code settings file isn't valid JSON, so Knock didn't change it. Please fix the file, or ask for help, then try again.";
-        let shape = "Your Claude Code settings file is laid out in a way Knock doesn't recognise, so Knock didn't change it.";
+        let not_json = "Your Claude Code settings file isn't valid JSON, so Knock can't read it. Fix the file, or ask for help, then run this again.";
+        let shape = "Your Claude Code settings file is laid out in a way Knock doesn't recognise, so Knock can't check it. Ask for help, then run this again.";
         for (bad, want) in [
             (&b"{ \"hooks\": "[..], not_json),
             (b"", not_json),
@@ -1321,29 +1335,105 @@ mod tests {
         // Accepts, then closes without a word.
         let (port, _rx) = stand_in(String::new());
         assert_eq!(get_health(port, TOKEN, SHORT), Reply::NoAnswer);
-        // 200 with a body that doesn't say: listening, but no last event.
-        for body in [
+        // A 200 that isn't Knock's health reply: another program holds
+        // Knock's port (ADR 0023). Not listening; Repair; check 3 unchecked.
+        let other = check(
+            SERVER,
+            false,
+            "Something other than Knock answered on Knock's connection. Open Knock's Settings and choose Repair.",
+        );
+        let full = json!({
+            "version": "0.3.0",
+            "uptimeS": 5,
+            "sessionCount": 0,
+            "lastEventAt": null,
+        });
+        let mut bodies: Vec<String> = [
             "",
             "{}",
             "not json",
-            r#"{"lastEventAt": 5}"#,
-            r#"{"lastEventAt": "yesterday"}"#,
-        ] {
+            "[]",
+            "[{\"version\": \"0.3.0\"}]",
+            "null",
+            "\"ok\"",
+            "<html><body>It works!</body></html>",
+        ]
+        .map(String::from)
+        .to_vec();
+        for key in ["version", "uptimeS", "sessionCount", "lastEventAt"] {
+            // Each field missing, then each of the wrong kind.
+            let mut v = full.clone();
+            v.as_object_mut().unwrap().remove(key);
+            bodies.push(v.to_string());
+            let mut v = full.clone();
+            v[key] = match key {
+                "version" => json!(3),
+                "lastEventAt" => json!(1_792_166_400_000_u64),
+                _ => json!("5"),
+            };
+            bodies.push(v.to_string());
+        }
+        let mut v = full.clone();
+        v["version"] = Value::Null;
+        bodies.push(v.to_string());
+        for body in &bodies {
             let (port, _rx) = stand_in(http("200 OK", body));
             let r = get_health(port, TOKEN, SHORT);
-            assert!(server_check(&conn(port), Some(&r)).ok, "{body}");
-            let c = last_check(Some(&r), NOW);
-            assert!(
-                !c.ok && c.detail.starts_with("Knock answered, but"),
+            assert_eq!(r, Reply::Other, "{body}");
+            assert_eq!(server_check(&conn(port), Some(&r)), other, "{body}");
+            assert_eq!(
+                last_check(Some(&r), NOW),
+                check(LAST, false, not_listening),
                 "{body}"
             );
             assert_eq!(info(&r), None, "{body}");
+        }
+        // Knock's own shape passes, with null or a time, and extra fields
+        // or other key order don't matter.
+        for body in [
+            full.to_string(),
+            health_body(Some(NOW)),
+            r#"{"lastEventAt":null,"sessionCount":3,"uptimeS":0.5,"version":"9.9.9","extra":1}"#
+                .into(),
+        ] {
+            let (port, _rx) = stand_in(http("200 OK", &body));
+            let r = get_health(port, TOKEN, SHORT);
+            assert!(matches!(r, Reply::Ok(_)), "{body}");
+            assert!(server_check(&conn(port), Some(&r)).ok, "{body}");
+        }
+        // Knock's shape with a time Knock never writes: listening, but the
+        // last event can't be read.
+        let mut v = full.clone();
+        v["lastEventAt"] = json!("yesterday");
+        let (port, _rx) = stand_in(http("200 OK", &v.to_string()));
+        let r = get_health(port, TOKEN, SHORT);
+        assert!(server_check(&conn(port), Some(&r)).ok);
+        let c = last_check(Some(&r), NOW);
+        assert!(
+            !c.ok && c.detail.starts_with("Knock answered, but"),
+            "{c:?}"
+        );
+    }
+
+    /// The reply the app's `health` handler builds (server.rs:393-402), for
+    /// a Knock that has heard nothing and one that has: both are Knock.
+    #[test]
+    fn the_apps_real_health_reply_is_knock() {
+        for last in [None, Some(NOW)] {
+            let v = json!({
+                "version": "0.3.0-beta.1",
+                "uptimeS": 0_u64,
+                "sessionCount": 0_usize,
+                "lastEventAt": last.map(knock_core::iso8601),
+            });
+            assert!(is_health(&v), "{v}");
+            assert_eq!(last_event(&v), Ok(last), "lastEventAt round-trips: {v}");
         }
     }
 
     #[test]
     fn info_shows_only_a_plain_version() {
-        let reply = |v: Value| Reply::Ok(v.to_string().into_bytes());
+        let reply = Reply::Ok;
         let one = reply(json!({ "version": "1.2.3", "sessionCount": 1 }));
         assert_eq!(
             info(&one).as_deref(),
@@ -1447,15 +1537,30 @@ mod tests {
         add(run(&d.paths(), NOW, SHORT));
         std::fs::remove_dir(d.settings()).unwrap();
         // A stand-in that refuses, one that answers oddly, one that never
-        // heard, and one whose reply holds the token and a path.
+        // heard, Knock-shaped replies holding the token or a path, and 200s
+        // that aren't Knock's (some holding the token or a path).
+        let path = d.0.display().to_string();
+        let knock_shaped = |version: &str, last: &str| {
+            json!({ "version": version, "uptimeS": 1, "sessionCount": 1, "lastEventAt": last })
+                .to_string()
+        };
         for reply in [
             http("401 Unauthorized", TOKEN),
-            http("500 Internal Server Error", &format!("{TOKEN} C:\\Users\\x")),
+            http(
+                "500 Internal Server Error",
+                &format!("{TOKEN} C:\\Users\\x"),
+            ),
             http("200 OK", &health_body(None)),
+            http("200 OK", &knock_shaped(TOKEN, &path)),
+            http("200 OK", &knock_shaped(r"C:\x", TOKEN)),
+            http("200 OK", &knock_shaped("1/2", "/tmp/x")),
+            http("200 OK", ""),
+            http("200 OK", "{}"),
+            http("200 OK", &format!("{TOKEN} {path}")),
+            http("200 OK", &json!([TOKEN, path]).to_string()),
             http(
                 "200 OK",
-                &json!({ "version": TOKEN, "sessionCount": 1, "lastEventAt": d.0.display().to_string() })
-                    .to_string(),
+                &json!({ "version": TOKEN, "sessionCount": 1, "lastEventAt": path }).to_string(),
             ),
         ] {
             add(run_with(&Dir::new(), Some(reply)));
