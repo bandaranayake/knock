@@ -16,6 +16,7 @@
 //   save=fail               update_settings rejects every change
 //   knock=fail              play_test_knock rejects
 //   empty=1                 the settings file doesn't exist yet, so there is no backup
+//   diag=fail               get_diagnostics rejects, so Settings shows no version
 // Every call is logged under the page and kept in `window.__calls`.
 import type { Settings } from "../../overlay/bridge";
 import type { Check, Monitor } from "../core";
@@ -121,40 +122,80 @@ const before = () =>
 		: text(installed ? withHooks(hookPort) : userFile);
 const BACKUP = String.raw`C:\Users\Sam\AppData\Roaming\Knock\backups\settings.20261101-142530.json`;
 
+// Health checks (§8.5, FR-12): the core's `health()` gives each check a fixed label that
+// never changes with the result — pass or fail rides in `ok`, which the page draws as ✓ or
+// ✗ — so the mock uses the same three ids and labels, and details worded as the core words
+// them for the same situation. No path (but the file name), no token, no port, no project.
 const checks = (): Check[] => [
-	installed
-		? {
-				id: "hooks",
-				label: "Knock is connected to Claude Code",
-				ok: true,
-				detail: "Claude Code's settings file has all of Knock's entries.",
-			}
-		: {
-				id: "hooks",
-				label: "Knock isn't connected to Claude Code",
-				ok: false,
-				detail: "Run setup to connect it.",
-			},
-	serverError === null
-		? {
-				id: "server",
-				label: "Knock is listening for Claude Code",
-				ok: true,
-				detail: "Claude Code can reach Knock on this PC.",
-			}
-		: {
-				id: "server",
-				label: "Knock can't listen for Claude Code",
-				ok: false,
-				detail: "Use Repair to pick a new connection.",
-			},
 	{
-		id: "last",
-		label: "Last heard from a session",
+		id: "hooks",
+		label: "Connected to Claude Code",
+		ok: installed,
+		detail: installed
+			? "Knock is in your Claude Code settings (settings.json)."
+			: "Knock isn't in your Claude Code settings (settings.json), or its entry is out of date. Run setup to connect it.",
+	},
+	{
+		id: "server",
+		label: "Listening for Claude Code",
+		ok: serverError === null,
+		detail:
+			serverError === null
+				? "Knock is listening for Claude Code, on this computer only."
+				: "Knock isn't listening for Claude Code. Choose Repair to fix it.",
+	},
+	{
+		id: "lastEvent",
+		label: "Last event from Claude Code",
 		ok: true,
-		detail: "2 minutes ago",
+		detail: "Knock last heard from Claude Code 2 minutes ago.",
 	},
 ];
+
+// Diagnostics (§8.5, ADR 0038): the core builds this text, so the mock does too, in the
+// same sections, labels and words as `diagnostics::text` in the core. It holds no agent
+// content, no token, no port, no session id, no project name, no name, no path, no display
+// geometry and no monitor id.
+const VERSION = "0.3.0-beta.1";
+const onOff = (b: boolean) => (b ? "on" : "off");
+// `launchAtSignIn` is three-valued: null until setup asks (§8.6), and the core says which
+// of the three it is, because null is what still opens setup by itself (ADR 0039).
+const signIn = (setting: boolean | null) =>
+	setting === null ? "not chosen yet" : onOff(setting);
+// A display's scaling, as Windows shows it. The width only picks the mock's answer; it is
+// never printed, because ADR 0038 lists each display's scaling and nothing else.
+const scaling = (m: Monitor) => (m.width >= 2560 ? "150%" : "100%");
+// One pretend set of sessions, so the counts read like a busy machine's would.
+const TIERS = "needs you 1, working 2, done 1, resting 0";
+const JUMP = "exact window 3, app window 1, none 0";
+const diagnosticsText = () =>
+	[
+		`Knock ${VERSION}`,
+		"Windows 11, version 24H2 (build 26200.1742)",
+		"",
+		"Checks",
+		...checks().map(
+			(c) => `  ${c.label}: ${c.ok ? "pass" : "fail"} - ${c.detail}`,
+		),
+		"",
+		"Sessions 4",
+		`  ${TIERS}`,
+		`  jump target: ${JUMP}`,
+		"",
+		"Settings",
+		`  show as ${settings.mode}, size ${settings.size}, taskbar ${
+			settings.monitor === "primary" ? "main display" : "a chosen display"
+		}`,
+		`  stuck after ${settings.stallMinutes} min, remind after ${settings.escalationMinutes} min, notify when stuck ${onOff(settings.notifyOnStall)}`,
+		`  notifications paused ${onOff(settings.pauseNotifications)}, quiet hours ${onOff(settings.quietHours.enabled)}, start at sign-in ${signIn(settings.launchAtSignIn)}`,
+		"",
+		`Displays ${monitors.length}`,
+		...monitors.map(
+			(m, i) =>
+				`  display ${i + 1}${m.primary ? " (main)" : ""}: ${scaling(m)}`,
+		),
+		"",
+	].join("\n");
 
 const handlers = new Map<string, ((e: { payload: unknown }) => void)[]>();
 const emit = (event: string, payload: unknown) => {
@@ -230,6 +271,11 @@ const commands: Record<string, (args: Record<string, unknown>) => unknown> = {
 		return { ok: true, backup: BACKUP };
 	},
 	run_health_check: () => checks(),
+	get_diagnostics: () => {
+		if (q.get("diag") === "fail")
+			throw "Knock couldn't gather the details just now.";
+		return { version: VERSION, text: diagnosticsText() };
+	},
 	play_test_knock: () => {
 		if (q.get("knock") === "fail") throw "The strip isn't showing.";
 	},

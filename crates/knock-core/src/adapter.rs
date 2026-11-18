@@ -112,8 +112,9 @@ fn charset(s: &str, max: usize, ok: impl Fn(char) -> bool) -> bool {
     (1..=max).contains(&s.len()) && s.chars().all(ok)
 }
 
-/// `^[A-Za-z0-9_-]{1,128}$`, for `session_id` and `agent_id`.
-fn is_id(s: &str) -> bool {
+/// `^[A-Za-z0-9_-]{1,128}$`, for `session_id` and `agent_id` (and a
+/// restored session's id).
+pub(crate) fn is_id(s: &str) -> bool {
     charset(s, 128, |c| {
         c.is_ascii_alphanumeric() || c == '_' || c == '-'
     })

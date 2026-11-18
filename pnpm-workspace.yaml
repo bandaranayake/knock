@@ -1,2 +1,13 @@
 packages:
   - apps/desktop/ui
+
+# ADR 0043: picomatch's ReDoS advisory, ignored by id until a fixed version
+# exists. It reaches the tree only through vite's build tooling, never ships
+# in the installer, and sees only this repository's own glob patterns. No
+# patched picomatch has been published, so there is nothing to upgrade to.
+# Remove this when there is. Only this advisory is ignored: `pnpm audit`
+# still runs on every pull request and still fails on anything else
+# (SPEC.md §11 rule 10).
+auditConfig:
+  ignoreGhsas:
+    - GHSA-fc5q-39xc-vjpf

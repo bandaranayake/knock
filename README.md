@@ -50,7 +50,7 @@ When a session needs you, its animal knocks. Click it to jump straight there.</p
 
 ## Install
 
-1. Download `Knock_0.3.0-beta.1_x64-setup.exe` from the [Releases page](https://github.com/bandaranayake/knock/releases).
+1. Download `Knock_0.9.0_x64-setup.exe` from the [Releases page](https://github.com/bandaranayake/knock/releases).
 2. Run it. It installs for your user only, with no administrator rights.
 3. Follow the short setup.
 
@@ -69,6 +69,15 @@ If Knock isn't running, Claude Code carries on normally. The hooks fail quickly 
 ## Privacy
 
 Knock never reads your conversations, prompts or code. No telemetry, no accounts, no internet. Everything stays on your computer.
+
+**Copy diagnostics**, in Settings, is the one time Knock gathers anything about your machine, and it only puts it on your clipboard — nothing is sent anywhere. Paste it somewhere first if you want to read it before sharing. It contains:
+
+- Knock's version and your Windows version.
+- The results of Knock's own health check.
+- How many sessions Knock is tracking, and how many displays you have with their scaling.
+- Your Knock settings, such as size and whether notifications are paused.
+
+It never contains your project names, your folder paths, your user name, or anything you or Claude Code wrote.
 
 ## Uninstall
 

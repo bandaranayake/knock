@@ -4,6 +4,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+/// Tests only: the §8.5 commands, the ACL and the UI must agree.
+#[cfg(test)]
+mod acl;
+mod diagnostics;
 mod hooks;
 mod jump;
 mod log;
@@ -11,6 +15,7 @@ mod pipeline;
 mod platform;
 mod server;
 mod settings;
+mod snapshot;
 mod strip;
 mod tray;
 
@@ -35,9 +40,6 @@ const FALLBACK: Duration = Duration::from_secs(5);
 /// After a change was heard, placed again this much later, in case the
 /// shell was still settling (the taskbar sliding, a display waking).
 const RECHECK: Duration = Duration::from_millis(500);
-
-/// `setup_status.serverError` texts (ADR 0023).
-const CANT_START: &str = "Knock couldn't start listening for Claude Code. Another program may be using its connection. Choose Repair to give Knock a new one.";
 
 /// The local server: why it isn't running, and how to stop it.
 #[derive(Default)]
@@ -64,7 +66,9 @@ struct Knock {
     repairing: Mutex<()>,
     /// `%APPDATA%\Knock`.
     dir: PathBuf,
-    /// No Knock `settings.json` existed when the app started.
+    /// The user had never finished setup when the app started, that is
+    /// `launchAtSignIn` was `null` (§8.6, ADR 0039). `setup_status()` reports
+    /// it as `firstRun`, which titles setup's Welcome screen.
     first_run: bool,
 }
 
@@ -262,7 +266,7 @@ async fn repair_server(app: AppHandle, k: tauri::State<'_, Knock>) -> Result<Val
             json!({ "ok": true })
         }
         Err(e) => {
-            tracing::warn!(kind = ?e.kind(), "server not repaired");
+            tracing::warn!(step = ?e.step, kind = ?e.kind(), "server not repaired");
             json!({ "ok": false, "message": server::repair_failed(&e) })
         }
     })
@@ -355,10 +359,37 @@ struct Check {
     detail: String,
 }
 
-/// FR-12: real checks, in plain language, with no path but the file name
-/// and no token.
+/// §8.5: the health check's results. `get_diagnostics()` quotes these, so
+/// there is one copy of the checks (ADR 0038).
 #[tauri::command]
 async fn run_health_check(k: tauri::State<'_, Knock>) -> Result<Vec<Check>, String> {
+    Ok(health(&k).await)
+}
+
+/// §8.5, §11 rule 8, ADR 0038: Knock's version for the Settings line, and
+/// the plain text **Copy diagnostics** puts on the clipboard. Nothing is
+/// sent anywhere. The text is built by [`diagnostics::text`], which holds
+/// only what ADR 0038 lists.
+#[tauri::command]
+async fn get_diagnostics(k: tauri::State<'_, Knock>) -> Result<Value, String> {
+    let checks = health(&k).await;
+    let os = k.platform.windows_version();
+    let displays = k.platform.displays();
+    let version = env!("CARGO_PKG_VERSION");
+    let p = pipeline::read(&k.shared);
+    Ok(diagnostics::reply(&diagnostics::Facts {
+        version,
+        os,
+        checks: &checks,
+        sessions: &p.sessions.sessions,
+        settings: &p.settings,
+        displays: &displays,
+    }))
+}
+
+/// FR-12: real checks, in plain language, with no path but the file name
+/// and no token.
+async fn health(k: &Knock) -> Vec<Check> {
     let hooks = match k.hooks.status() {
         Ok(hooks::Hooks::Installed) => {
             (true, "Knock is in your Claude Code settings (settings.json).".into())
@@ -374,7 +405,7 @@ async fn run_health_check(k: tauri::State<'_, Knock>) -> Result<Vec<Check>, Stri
         ),
         Err(p) => (false, p.message().to_string()),
     };
-    let server = match server_ok(&k).await {
+    let server = match server_ok(k).await {
         true => (
             true,
             "Knock is listening for Claude Code, on this computer only.".into(),
@@ -405,11 +436,11 @@ async fn run_health_check(k: tauri::State<'_, Knock>) -> Result<Vec<Check>, Stri
         ok,
         detail,
     };
-    Ok(vec![
+    vec![
         check("hooks", "Connected to Claude Code", hooks),
         check("server", "Listening for Claude Code", server),
         check("lastEvent", "Last event from Claude Code", event),
-    ])
+    ]
 }
 
 /// "just now", "5 minutes ago", "1 hour ago", "2 days ago".
@@ -526,7 +557,6 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let platform: Arc<dyn Platform> = Arc::new(WindowsPlatform::new(&window)?);
 
     let dir = settings::data_dir()?;
-    let first_run = !dir.join(settings::FILE).exists();
     let shared = Shared::default();
     let now = pipeline::now_ms();
     let core = pipeline::Core::new(
@@ -536,6 +566,13 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         now,
         platform::local_minute(),
     );
+    // §8.6, ADR 0039: the user has never finished setup while
+    // `launchAtSignIn` is `null`. `setup_status().firstRun` and the rule for
+    // opening setup by itself ([`at_start`]) read the same value, so the
+    // Welcome screen can't say "Set up Knock again" for a setup that was
+    // never finished. Read once, before any window or command can change it.
+    let sign_in = pipeline::read(&shared).settings.launch_at_sign_in;
+    let first_run = setup_unfinished(sign_in);
     let (tx, rx) = std::sync::mpsc::channel();
     let tray = tray::build(app.handle(), tx.clone(), shared.clone())?;
     let listening = Arc::new(Mutex::new(Listening::default()));
@@ -600,16 +637,17 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         first_run,
     };
 
-    // If the port can't be bound, Knock keeps running and offers Repair
-    // (§8.1, ADR 0023).
+    // If the server can't start, Knock keeps running and says why (§8.1,
+    // ADR 0023). The log keeps the step and the real error kind, never a
+    // path or a body (§11.5).
     let started = server::listen(&k.dir).and_then(|(cfg, listener)| {
         let stop = serve(&k, &cfg, listener)?;
         adopt(app.handle(), &k, cfg, stop);
         Ok(())
     });
     if let Err(e) = &started {
-        tracing::error!(kind = ?e.kind(), "server failed to start");
-        server_down(app.handle(), &k, Some(CANT_START));
+        tracing::error!(step = ?e.step, kind = ?e.kind(), "server failed to start");
+        server_down(app.handle(), &k, Some(server::start_failed(e)));
     }
 
     let (p, s, sh) = (&*k.platform, &*k.strip, &k.shared);
@@ -657,9 +695,11 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
         })?;
 
-    // §10.4: setup opens by itself on first run, or while Knock isn't
-    // connected to Claude Code; Repair first if the server isn't running.
+    // §10.4, ADR 0039: setup opens by itself only until the user has
+    // answered its "Start Knock when you sign in?" step; Repair first if the
+    // server isn't running (ADR 0023).
     let installed = k.hooks.installed().unwrap_or(false);
+    // `first_run` is "setup never finished", the same value `at_start` uses.
     tracing::info!(
         first_run,
         installed,
@@ -667,12 +707,48 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         "setup status"
     );
     app.manage(k);
-    match (started.is_ok(), first_run || !installed) {
-        (false, _) => open_settings(app.handle(), "repair=1"),
-        (true, true) => open_settings(app.handle(), "setup=1"),
-        (true, false) => {}
+    match at_start(started.is_ok(), installed, sign_in) {
+        AtStart::Repair => open_settings(app.handle(), "repair=1"),
+        AtStart::Setup => open_settings(app.handle(), "setup=1"),
+        AtStart::Nothing => {}
     }
     Ok(())
+}
+
+/// What opens by itself when Knock starts.
+#[derive(Debug, PartialEq, Eq)]
+enum AtStart {
+    /// The server couldn't start, so the Repair screen (ADR 0023).
+    Repair,
+    /// Setup, because the user hasn't answered it yet (ADR 0039).
+    Setup,
+    /// Nothing: Knock starts quietly. Settings and the health check say if
+    /// it isn't connected to Claude Code, and setup can be reopened there.
+    Nothing,
+}
+
+/// ADR 0039: setup opens by itself only while `launch_at_sign_in` is `null`,
+/// that is, while the user has never answered setup's step 4 (§8.6, §10.4).
+/// This covers a first run and a setup closed before that step, so one
+/// closed by accident is offered again. Whether Knock's hooks are installed
+/// is deliberately not read: after the user has finished setup once, Knock
+/// starts quietly even when it is not connected to Claude Code, including
+/// after **Remove Knock from Claude Code**. A server that can't start comes
+/// first either way (ADR 0023).
+fn at_start(server_ok: bool, _hooks_installed: bool, launch_at_sign_in: Option<bool>) -> AtStart {
+    match (server_ok, setup_unfinished(launch_at_sign_in)) {
+        (false, _) => AtStart::Repair,
+        (true, true) => AtStart::Setup,
+        (true, false) => AtStart::Nothing,
+    }
+}
+
+/// The user has never finished setup: `launchAtSignIn` is still `null`
+/// (§8.6). The one rule for both `setup_status().firstRun`, which titles
+/// setup's Welcome screen, and [`at_start`], so a setup that is offered
+/// again is never greeted with "Set up Knock again".
+fn setup_unfinished(launch_at_sign_in: Option<bool>) -> bool {
+    launch_at_sign_in.is_none()
 }
 
 fn main() {
@@ -707,6 +783,7 @@ fn main() {
             setup_apply_hooks,
             setup_remove_hooks,
             run_health_check,
+            get_diagnostics,
             play_test_knock,
             repair_server,
         ])
@@ -717,6 +794,57 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::{AtStart, at_start, setup_unfinished};
+
+    /// `setup_status().firstRun` titles setup's Welcome screen, so it has to
+    /// mean the same as "setup opens by itself": a setup that was closed
+    /// before its last step is offered again and must still say "Welcome to
+    /// Knock" (the 2026-11-18 review of efaecac, finding 4). It used to mean
+    /// "settings.json didn't exist", which that user already has.
+    #[test]
+    fn first_run_means_setup_was_never_finished() {
+        assert!(setup_unfinished(None), "never answered");
+        assert!(!setup_unfinished(Some(true)), "answered yes");
+        assert!(!setup_unfinished(Some(false)), "answered no");
+        // The same rule as the one that re-opens setup, for every answer.
+        for answer in [None, Some(true), Some(false)] {
+            let offered = at_start(true, true, answer) == AtStart::Setup;
+            assert_eq!(offered, setup_unfinished(answer), "{answer:?}");
+        }
+    }
+
+    /// ADR 0039: setup opens by itself only until the user has answered its
+    /// "Start Knock when you sign in?" step.
+    #[test]
+    fn setup_opens_by_itself_only_until_it_has_been_finished_once() {
+        // Setup never finished (a first run, or a window closed before step
+        // 4): it is offered again, whatever the hooks say.
+        for installed in [true, false] {
+            assert_eq!(
+                at_start(true, installed, None),
+                AtStart::Setup,
+                "{installed}"
+            );
+        }
+        // Finished: Knock starts quietly from now on, even after the user
+        // chose Remove Knock from Claude Code, and whichever answer it was.
+        for answer in [Some(true), Some(false)] {
+            assert_eq!(at_start(true, true, answer), AtStart::Nothing, "{answer:?}");
+            assert_eq!(
+                at_start(true, false, answer),
+                AtStart::Nothing,
+                "hooks removed: still quiet"
+            );
+        }
+        // The server can't start: the Repair screen comes first either way
+        // (ADR 0023), including on a first run.
+        for answer in [None, Some(true), Some(false)] {
+            for installed in [true, false] {
+                assert_eq!(at_start(false, installed, answer), AtStart::Repair);
+            }
+        }
+    }
+
     #[test]
     fn ago_in_plain_words() {
         let (s, m, h, d) = (1000, 60_000, 3_600_000, 86_400_000);

@@ -16,6 +16,112 @@ Open questions for the user:
 
 ---
 
+## 2026-11-17: Phase 5 (hardening) started
+Done:
+- **Gate G2 passed** (user decision, 2026-11-17). Phase 4 is closed.
+- Local `develop` fast-forwarded to `origin/develop` (it was 9 commits behind).
+- Survey by the lead of what Phase 5 needs:
+  - Already built: the health check command and its screen in Settings (FR-12, Phase 2); `ended_unexpectedly` and the `crash` scenario.
+  - Not built: `knock doctor` (only named in the usage text); restoring `sessions.json` at start (FR-13; the file is written but never read); the **Copy diagnostics** button (§11 rule 8).
+- Brief 5.1 sent to `core-windows` on `phase-5/doctor`: `knock doctor`, read-only, inside `crates/knock-cli/`.
+- Brief 5.1 done (475a1a7): `knock doctor`, read-only, std only. Lead review passed; `pnpm check` passes. The fresh review is running; not merged yet.
+  - Lead fix: `.claude/settings.local.json` added to `.gitignore`, because Biome failed on it (1f93bf0).
+  - Clarifications (lead): doctor always reads the real §8.2 file, also in debug builds, since it only reads. It does not detect a hard-linked settings file (ADR 0024); std can't read a link count.
+- Fresh review of 475a1a7 (ADR 0029): no serious findings and no §8.1, §8.2 or §11 violation. Four minor ones, verified by the lead:
+  - (1) "Listening" passed on any `200`, even from another program on Knock's port. Real; fixed by `core-windows` (follow-up brief 5.1a): only Knock's own §8.1 health reply passes. Lead review passed; `pnpm check` passes. Merged into `develop`.
+  - **Accepted by the user as known limits (2026-11-17):**
+    - (2) Doctor does not detect a hard-linked settings file.
+    - (3) Doctor ignores `KNOCK_CLAUDE_SETTINGS`, so it can disagree with a development build.
+    - (4) Doctor uses the terminal's `CLAUDE_CONFIG_DIR`, which can differ from the running app's.
+- Three ADRs written and **approved by the user on 2026-11-17**. SPEC.md §8.4, §8.5 and §10.4 were updated. The user's choices are recorded in them:
+  - ADR 0037, restoring sessions after a restart: a Needs-you session knocks again with no second notification; a session whose program is gone shows "Session ended".
+  - ADR 0038, a `get_diagnostics()` command: Settings shows the version and gets a **Copy diagnostics** button.
+  - ADR 0039, deferred finding (4): setup opens by itself only until it has been finished once.
+- `phase-5/doctor` merged into `develop` (ea92203). Manual test for `knock doctor` given to the user; result not in yet.
+- Branch `phase-5/restore` created from `develop`. Two briefs are in flight on it:
+  - Brief 5.2 (`core-windows`), FR-13 restore. The agent stopped once on a usage limit and was resumed; `knock-core` has `Engine::restore`, `Saved`, `SavedNeeds`, `Liveness` and `RestoreError`, and the app-shell side is still to come.
+    - Lead note sent: the ADR 0019 test assertion "an episode always waits on at least one requester" must hold across a restore (counting the unknown requester), not be deleted.
+  - Brief 5.3 (`ui`), the UI side of ADR 0038: the version line and the **Copy diagnostics** button, built against the dev mock. The core side of `get_diagnostics()` is a later brief.
+- Lead survey of the deferred finding (5): all three misleading messages are core-side strings (`hooks.rs` `NoServer`, `main.rs` `CANT_START` and the health check's server detail). The one about "Choose Repair" with no button is the setup Connect screen, which shows the `NoServer` text while only Settings has a Repair button. They go in brief 5.4 with ADR 0039, after 5.2 merges, because they share `src-tauri` paths.
+- Brief 5.3 (`ui`) done and committed (df2a99a): the version line and **Copy diagnostics** in Settings, against the dev mock. Lead review passed; 139 Vitest and 88 settings screenshot tests pass, Biome clean, scope clean. Not user-testable until the core side exists.
+  - Deviations accepted by the lead: two short sentences instead of one beside the button; "Copied" clears after 8 s so the screenshot test doesn't flake; a `diagnostics.ts` module, since Vitest here tests pure logic and Playwright tests rendering.
+- Lead found: `pnpm test:visual` had 5 failing overlay screenshots (13-122 px, threshold 10), caused by an Edge update, not by any change: nothing in `overlay/` or `art/` had changed since the baselines of 2026-11-04 (1ff0a25). The lead opened the `icons` diff image and saw only anti-aliasing on edges. Brief 5.5 sent to `ui` to confirm each diff and regenerate only those five.
+- Lead found: `.github/workflows/ci.yml` runs only `pnpm check`, `cargo fetch --locked`, `cargo-deny` and `pnpm audit`. §13.4 also lists `pnpm test:visual`, `pnpm art:check`, a Windows build and a smoke test; none of them has ever run on GitHub.
+  - **ADR 0040, approved by the user on 2026-11-17:** CI gains `art:check`, the Windows build and the smoke test. `pnpm test:visual` stays local, run by the lead before merging any UI or art change, with the anti-aliasing check before any baseline is regenerated. The threshold stays at 10. SPEC.md §13.4 amended.
+- Brief 5.2 (`core-windows`) done and committed (f6881dc): sessions are restored at start (FR-13), with each process re-checked by PID and start time. Lead review passed; `pnpm check` passes (141 desktop, 44 engine, 27 restore, 2 invariants, 139 Vitest). Scope clean. Fresh review running (§11 rule 4 and 5 are in play), so not merged yet.
+  - `knock-core` stays pure: `Engine::restore` takes plain `Saved` data and the restore time. The new `snapshot.rs` is the only reader of `sessions.json`; the liveness check is passed in as a closure, so no OS call lives there.
+  - Snapshot: `turnDone` added (default `false`), so a file the released version wrote still restores. `simulated` is read and refused although it is never written.
+  - Invariants now generate restore points: snapshot → restore → continue, with each process randomly alive, gone or unknown.
+  - Existing tests changed, all justified and verified by the lead: the ADR 0019 "an open episode always waits on at least one requester" assertion now counts the unknown requester, as the lead instructed; the requester model accepts the unknown one; `snapshot_holds_no_agent_id_cwd_or_free_text` extended to the new keys and to a restored `Core`.
+  - Clarifications (lead), from the agent's open questions:
+    - A restored episode in which the main agent made its own request after the restart keeps knocking when that agent's `Stop` arrives, because the pre-restart requester may have been a sub-agent. `turn.started`, `agent.failed` and `session.ended` still close it, so it can't stick.
+    - An unknown `activity` or `precision` string refuses the whole file, like any other entry Knock can't understand (item 7).
+    - No length or charset check on `project`, `projectKey` or `animal`: Knock is the only writer, and the overlay already falls back to the fox for an unknown animal id (Phase 3 decision, with a visual test).
+    - **To do in brief 5.4:** the health check's "last heard from Claude Code" is not restored, so after a restart it says Knock has heard nothing until the first hook arrives. FR-12 says the health check reports the last event time, so it should read the saved `lastEventMs`. This also feeds `GET /v1/health` and `knock doctor`.
+- Fresh review of f6881dc (ADR 0029): §11 rules 4 and 5 hold, §7.3 holds, and ADR 0037 items 1, 2, 4, 6, 7 and 8 check out. Three findings, all verified by the lead in the committed tests, all sent back as brief 5.2a:
+  - **(1) A missed knock.** For a restored episode, `turn.completed` consumed the unknown requester, so a session whose sub-agent was waiting became "Done, ready to review" when the main agent's turn ended, while the permission prompt sat unanswered and nothing could bring it back. Breaks §6 Reliability. The code exceeded ADR 0037 item 5, which gives only `activity` that power, and contradicted the existing §8.4 `turn.completed` row. ADR 0037 item 5 now pins this, with the accepted cost: a lingering knock the user can clear beats a silently lost one.
+  - **(2) The 6-hour clock restarted at every restart** for a session found gone, against §8.4 Restore, ADR 0037 item 4 and the code's own doc comment. A failed session with a closed terminal lingered 6 h from each restart instead of from its last event.
+  - **(3) The health check said "no events" right after a restore**, although every saved entry carries its last-event time. Fixed per FR-12; also feeds `GET /v1/health` and `knock doctor`. Recorded in ADR 0037.
+  - Not changed: `project`, `projectKey` and `animal` are read unchecked. Robustness only, nothing leaves the machine, and the overlay falls back to the fox.
+- Brief 5.5 (`ui`) done and committed (0048226): four overlay baselines regenerated after each diff was confirmed to be anti-aliasing only (13-53 px; same text, layout, poses, badges).
+  - The fifth was **refused**, correctly: `animals-stepping-down` is not drift but a flaky mid-animation capture — the fox one pixel lower, 122 px, intermittent. The lead reproduced it: 1 pass, 3 failures in four runs, identical every time. It has been unreliable since it was written and would fail at random on any machine; ADR 0040 makes that a merge blocker. Brief 5.7 sent to `ui` to fix the timing at its source, with 12 consecutive passes required as evidence. Loosening the threshold, a retry, a mask or a sleep are all ruled out.
+- Brief 5.2a done (ca2ffaf): all three findings fixed and verified by the lead. `turn.completed` passes `stand_in: false` to `remove()`, so only `activity` may stand in for the unknown requester; `Session::gone(now, gone_since)` separates the fade clock from the 6-hour clock; `last_event_at` is seeded from the restored sessions. New test `a_subagents_knock_survives_a_restart_and_the_main_agents_stop` builds the review's scenario through a real save and restore.
+  - Consequence pinned by the fix: a session found gone whose saved last event is already over 6 h old is dropped at restore instead of fading for 60 s. That is what §8.4 asks for.
+- Brief 5.7 done (0cc31cc): the flaky step-down capture is fixed at its source. Playwright's fake clock puts animation frames on a 16 ms grid whose phase carries a few ms of real time, so the capture landed anywhere in a 32 ms window. A repeated `sessions-changed` restarts nothing and draws one more frame at exactly the clock's reading. 18 consecutive passes (12 by the agent, 6 by the lead) against 1 in 4 before. The threshold stays at 10; no tolerance, retry, mask or sleep.
+  - `ui` noted that `animals-knocking`, `animals-den-step-out` and the looping states are stable only because their instants sit where ±32 ms is sub-pixel. If one starts flaking, the same pinning fixes it.
+- **`phase-5/restore` merged into `develop` (fee183d).** Lead's full run before the merge, per ADR 0040: `pnpm check` passes (144 desktop, 30 restore, 44 engine, 2 invariants, 49 CLI, 139 Vitest), `pnpm test:visual` 225 passed 0 failed, `pnpm art:check` passes.
+- Brief 5.4 done (efaecac) on `phase-5/diagnostics-core`. Lead review passed; `pnpm check` passes (156 desktop tests). Scope clean. Fresh review running (§11 rule 8), so not merged yet.
+  - `get_diagnostics()` builds the text in a new `diagnostics.rs`; `run_health_check` was split so there is one copy of the checks. The privacy test asserts the text holds no token, session id, project name, tool name, monitor id, project key, user name or port, no `\` or `/`, and no window geometry.
+  - The Windows version and display scaling go through the platform trait (§7.3); the registry read is read-only.
+  - Start-up rule: `at_start(server_ok, hooks_installed, launch_at_sign_in)` — Repair when the server failed, Setup only while `launchAtSignIn` is `null`, else nothing (ADR 0039).
+  - The three messages now distinguish their causes: a port in use versus an unusable `server.json`; a development build versus a release build with no `USERPROFILE`; and "Choose Repair in Settings", verified against all four places `NoServer` can reach the user.
+  - Lead decisions on its two questions: display resolution stays out (ADR 0038 lists scaling only), and `launchAtSignIn` printing as "not chosen yet" is right, since that value now decides whether setup opens by itself.
+  - To do: the UI's `settings/dev/mock.ts` diagnostics text no longer matches the real format, and the `settings-report-refused-*` screenshots show the mock's text. Cosmetic, UI-owned; fold into the next `ui` brief.
+- Fresh review of efaecac (ADR 0029): §7.1, §7.3, §8.1, §8.2, §8.5, §8.6, §10.4 and §11 rules 3-5 and 8 all check out, and the exclusion tests are genuine. Four findings, all verified by the lead, sent back as brief 5.4a:
+  - **(1) The whole feature was dead in a real build.** `get_diagnostics` was missing from `build.rs` `COMMANDS`, from `capabilities/settings.json` and from `permissions/autogenerated/`, so Tauri's ACL rejects the invoke: the version line never renders and every click says "Knock couldn't gather the details just now". All 156 tests passed, because none of them goes through a window's ACL. The fix must include a test that compares the real lists, not a fourth hand-written copy.
+  - (2) `start_failed()` still claimed "another program may be using its connection" for a `PermissionDenied` from `save()`, i.e. a locked-down `%APPDATA%\Knock`. Repair cannot help, so the user loops forever on a false explanation.
+  - (3) An unreadable `server.json` now logs as `InvalidData`, losing the real error kind.
+  - (4) `firstRun` still means "settings.json didn't exist", so a setup closed before step 4 — exactly the case ADR 0039 keeps offering again — is greeted with "Set up Knock again". The UI's dev mock already had the right rule; the core is the wrong side.
+- Brief 5.6 done and committed (0a9a90e): `ci.yml` now runs `pnpm art:check`, a debug build, a smoke test and the installer build, with no `continue-on-error`, read-only permissions and a 90-minute timeout. `pnpm test:visual` appears only in a comment explaining why it is not there (ADR 0040). The lead parsed the workflow and checked those properties.
+  - The smoke test launches the debug build with `%APPDATA%` pointed at a throwaway folder and `KNOCK_CLAUDE_SETTINGS` cleared, checks `/v1/debug/snapshot` refuses an untokened request (§8.1, §11 rule 1), plays `three-knocks` through the real server with `knock sim`, and asserts the published sessions. It never touches the real `%APPDATA%` or any Claude Code settings file.
+  - Honest gaps, stated in the workflow itself: no install, nothing visual, no taskbar maths, no toasts, no tray.
+- **ADR 0041, approved by the user on 2026-11-18:** Knock has no nightly workflow — `nightly.yml` has never existed, although §13.4 listed it since the start. SPEC.md §13.4 drops the row and §12.1's Smoke row now says CI does not install. Also recorded: installing stays the user's manual test, and CI gets no Rust cache (it would need a new action and would break the "exactly one installer" check).
+- **2026-11-18: the user passed both manual tests**, each against a build of `develop`:
+  - `knock doctor` (FR-12): the three lines agree with the in-app health check, and they change as expected when Knock is stopped and started again.
+  - Restart recovery (FR-13): sessions come back after a restart, a knocking session is still knocking, a finished one is still "Done, ready to review", the health check reports a real last-event time, and an ended session fades.
+  - §12.4 item 6 is therefore met for both. The full §12.2 release matrix is still to run before v0.9.
+- Brief 5.4a done (a838270): all four findings fixed. The ACL guard is `src/acl.rs`, two tests that read the real files — `build.rs` `COMMANDS`, the identifiers in `generate_handler!`, the generated `permissions/autogenerated/*.toml`, every `capabilities/*.json`, and the command literals each window's UI actually invokes. The lead verified it independently by deleting `allow-get-diagnostics` and confirming both tests fail, one with "ui/settings invokes get_diagnostics, but settings.json doesn't grant it", then restoring it.
+  - `listen()` now returns a typed `StartError { step, error }`, so a save failure is never reported as a busy port and the log keeps the real kind. `firstRun` is `launchAtSignIn.is_none()`, used for both `setup_status()` and `at_start`, so they cannot disagree.
+  - What the ACL test cannot catch, per the agent: whether Tauri accepts the invoke at run time. One line added to the user's checklist instead.
+- Brief 5.4b done (141e1af): `repair()` carries the same `Step`, so pressing Repair with an unwritable `%APPDATA%\Knock` now says nothing changed, that trying again will not help until the cause is fixed, and what to do. The bind case still invites a retry, which is honest. The agent reported this residual itself rather than widening brief 5.4a's scope.
+- **`phase-5/diagnostics-core` merged into `develop` (b013043).** Lead's full run before the merge, per ADR 0040: `pnpm check` passes (159 desktop, 30 restore, 44 engine, 139 Vitest), `pnpm test:visual` 225 passed 0 failed, `pnpm art:check` passes.
+- README privacy note for Copy diagnostics written (ADR 0038): what it collects, what it never collects, and that nothing is sent anywhere.
+- Briefs 5.8, 5.9 and 5.9a (`ui`) done (cc812b6, 1536232, and the fixture alignment): the Settings dev mock now produces the core's real diagnostics text and the core's three fixed health-check labels, and the Vitest fixture quotes wording the core really emits.
+  - This mattered beyond tidiness: ADR 0040 makes the Settings screenshots the gate the lead runs before any UI merge, and they had been verifying wording the app never produces. `ui` checked all 18 regenerated screenshots individually by bounding the changed pixels; 17 changed only inside the three-line checks block, and `settings-errors-*` grew 21 px because the core's real failure sentence wraps to a second line.
+  - `ui` flagged rather than silently changed: one assertion in `settings.visual.ts` that quoted an invented sentence, and the Vitest fixture. Both were then fixed on the lead's say-so.
+- **ADR 0042, approved by the user on 2026-11-18:** v0.9 is downloaded from a GitHub pre-release, not auto-updated. §13.5 said "via auto-update" although no updater, `latest.json` or updater key exists and §14 puts all three in Phase 6. SPEC.md §13.5 amended.
+- The §12.2 release matrix was written and given to the user as six standalone tests (fresh install and setup; terminals and jumping; display scaling; taskbar and monitors; Do Not Disturb and animation effects; upgrade and uninstall), about 90 minutes in total. It includes the one thing no automated test can prove: that a built app's Settings window may actually invoke `get_diagnostics` (the ACL fix of brief 5.4a).
+- Four spec-versus-reality gaps were closed this session: CI checks that never ran (ADR 0040), a `nightly.yml` that never existed (ADR 0041), a v0.9 auto-update that cannot happen (ADR 0042), and visual baselines that compared against invented wording (briefs 5.8, 5.9).
+- Version bumped to **0.9.0** (8724947): `apps/desktop/src-tauri/Cargo.toml` (the single source `release.yml` reads via `cargo metadata`), `Cargo.lock`, the README's installer name and both issue templates' placeholders. Release notes written at `docs/releases/v0.9.0.md`, which `release.yml` picks up. `cargo fetch --locked` verified, since a stale lock file fails CI.
+- **First pull request on the new CI failed at `pnpm audit`** (2026-11-18): GHSA-fc5q-39xc-vjpf, picomatch ReDoS, high.
+  - Lead's findings: no fixed version exists (`npm view picomatch version` → 4.0.7; the advisory names 4.0.8, never published), it reaches the tree only through `vite` as a dev dependency across 12 paths, it is absent from `apps/desktop/ui/dist` and so from the installer, and the only glob patterns it sees are this repository's own.
+  - **ADR 0043, approved by the user on 2026-11-18:** ignore that one advisory by id until a fix ships.
+  - The setting had to go in `pnpm-workspace.yaml`, not `package.json`: pnpm 11 warns that "the `pnpm` field in package.json is no longer read". The lead found this by checking the real exit code — the first two attempts looked plausible but still exited 1.
+  - `pnpm audit` now exits 0 and still prints "1 high (1 ignored)", so the finding stays visible, and it still fails on anything else.
+Next:
+- The user builds 0.9.0 (`pnpm build`) and runs the §12.2 matrix.
+- When it passes: Phase 5 ends, the user publishes v0.9 as a pre-release (unsigned installer, Smart App Control, §13.5), then Phase 6 (ship): `release.yml` tag trigger, updater, `latest.json`, landing page, demo recording, and Gate G3.
+- Then: the README privacy note (ADR 0038), the dev-mock alignment, and the §12.2 manual matrix for v0.9.
+- Then: an error-handling survey, the README privacy note (ADR 0038), and the §12.2 manual matrix for v0.9.
+- Brief 5.4: the core side of `get_diagnostics()`, the ADR 0039 start-up rule, the restored last-event time, and the finding (5) messages.
+- Brief 5.6 (`core-windows`, `.github/`): make `ci.yml` match the amended §13.4 (ADR 0040).
+- Then: an error-handling survey, the README privacy note for Copy diagnostics (ADR 0038), and the §12.2 manual matrix for v0.9.
+Dependencies added: none
+Clarifications: none
+Open questions for the user:
+- none
+- Reminder for the lead: when Copy diagnostics is merged, add the README privacy note (ADR 0038).
+
 ## 2026-11-06: Phase 4, public beta preparation
 Done:
 - ADR 0035 (approved by the user): v0.3 is a **public** beta via a GitHub pre-release, and the user judges G2 from setup reports. SPEC.md §13.5 and §14 were updated.
@@ -36,9 +142,13 @@ Done:
   - It never publishes.
   - The build job is read-only; only the release job can write.
   - Reviewed by the lead and the user; action SHAs verified against their tags. Not yet run on GitHub.
+- 2026-11-08: the user ran the Release workflow and **published v0.3.0-beta.1** as a public GitHub pre-release. The sidebar shows a tag count, not "Latest", because it is a pre-release; this is expected.
+- 2026-11-08: the user tested the GitHub-built installer and passed the quick check:
+  - Upgrade keeps settings.
+  - A second launch opens Settings.
+  - Setup works.
+- README badges, added by the user: the beta badge works. The shields.io license badge showed "repo not found", a stale cache from when the repo was private (GitHub's API reports MIT). The user chose to leave it as is.
 Next:
-- The user makes the repo public, creates the `setup-report` label and merges develop → main.
-- Then the user runs the Release workflow, reviews the draft and publishes it.
 - Gate G2: the user judges it from setup reports.
 Dependencies added: none
 Clarifications: none

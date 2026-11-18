@@ -1,5 +1,6 @@
 //! Knock helper CLI (SPEC.md §7.1, §13.3).
 
+mod doctor;
 mod fixtures;
 mod replay;
 mod sim;
@@ -10,6 +11,8 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match args.as_slice() {
+        // Prints its own report; exit 0 only when every check passes.
+        ["doctor"] => return doctor::main(),
         ["sim", name] => sim::live(name, 1.0),
         ["sim", name, "--speed", f] => match f.parse() {
             Ok(f) => sim::live(name, f),

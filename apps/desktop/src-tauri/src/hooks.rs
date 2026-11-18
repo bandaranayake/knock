@@ -35,7 +35,9 @@ pub const MASK: &str = "••••";
 /// path, token or file content, so it is safe to show and to log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Problem {
-    /// Debug build without `KNOCK_CLAUDE_SETTINGS`.
+    /// No settings file to edit: a debug build without
+    /// `KNOCK_CLAUDE_SETTINGS`, or a release build that can't tell where the
+    /// user folder is ([`no_path_message`]).
     NoPath,
     /// The local server isn't running, so there is no port or token.
     NoServer,
@@ -58,11 +60,13 @@ pub enum Problem {
 impl Problem {
     pub fn message(self) -> &'static str {
         match self {
-            Self::NoPath => {
-                "This is a development build of Knock, so it never changes your real Claude Code settings. Set KNOCK_CLAUDE_SETTINGS to a test file to try setup."
-            }
+            Self::NoPath => no_path_message(cfg!(debug_assertions)),
+            // Shown on the setup Connect screen and in the health check's
+            // "Connected to Claude Code" line. Neither has a Repair button
+            // of its own, so the text says where that button is, as the
+            // Welcome screen does.
             Self::NoServer => {
-                "Knock isn't listening for Claude Code right now, so it can't connect them yet. Choose Repair first, then try again."
+                "Knock isn't listening for Claude Code right now, so it can't connect them yet. Choose Repair in Settings, then try again."
             }
             Self::Unreadable => {
                 "Knock couldn't open your Claude Code settings file, so it didn't change anything. Please try again."
@@ -90,6 +94,26 @@ impl Problem {
             Self::RealFile => {
                 "This is a development build of Knock, so it never changes your real Claude Code settings, even through a link. Point KNOCK_CLAUDE_SETTINGS at a test file."
             }
+        }
+    }
+}
+
+/// [`Problem::NoPath`] in words. There is no settings file to edit for two
+/// quite different reasons, so each gets its own text:
+///
+/// - a development build, which only ever edits the file
+///   `KNOCK_CLAUDE_SETTINGS` names, so a developer who hasn't set it sees
+///   how to try setup (`debug`);
+/// - a release build, where the path is worked out from the environment
+///   (ADR 0022) and so is missing only when Windows didn't say where the
+///   user folder is. The development-build text would be nonsense there.
+pub fn no_path_message(debug: bool) -> &'static str {
+    match debug {
+        true => {
+            "This is a development build of Knock, so it never changes your real Claude Code settings. Set KNOCK_CLAUDE_SETTINGS to a test file to try setup."
+        }
+        false => {
+            "Knock couldn't work out where your Claude Code settings file is, because Windows didn't say where your user folder is. Please restart Knock, and if that doesn't help, restart your computer."
         }
     }
 }
@@ -746,7 +770,10 @@ impl Setup {
 /// variable is non-empty, then `%USERPROFILE%\.claude\settings.json`.
 fn claude_files(env: impl Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
     let config = env("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty());
-    let home = env("USERPROFILE").map(|h| PathBuf::from(h).join(".claude"));
+    // Empty is no path at all: joining it would give a path relative to
+    // Knock's own folder, which is not Claude Code's settings file.
+    let home =
+        (env("USERPROFILE").filter(|v| !v.is_empty())).map(|h| PathBuf::from(h).join(".claude"));
     (config.map(PathBuf::from).into_iter())
         .chain(home)
         .map(|d| d.join("settings.json"))
@@ -1668,6 +1695,14 @@ mod tests {
             [PathBuf::from(r"D:\cfg\settings.json")]
         );
         assert!(claude_files(env(&[])).is_empty());
+        // An empty USERPROFILE is no home at all, not a relative path: with
+        // no path, setup says so ([`no_path_message`]).
+        assert!(claude_files(env(&[("USERPROFILE", "")])).is_empty());
+        let unset = [("USERPROFILE", ""), ("CLAUDE_CONFIG_DIR", r"D:\cfg")];
+        assert_eq!(
+            claude_files(env(&unset)),
+            [PathBuf::from(r"D:\cfg\settings.json")]
+        );
     }
 
     #[test]
@@ -1741,6 +1776,62 @@ mod tests {
                 "{p:?}"
             );
         }
+        for debug in [true, false] {
+            let m = no_path_message(debug);
+            assert!(!m.contains('\\') && !m.contains(TOKEN) && m.ends_with('.'));
+        }
+    }
+
+    /// No settings file to edit means two different things, so each build
+    /// says its own true thing (deferred finding 5 of the 2026-11-06
+    /// review). The release text used to claim a development build.
+    #[test]
+    fn no_settings_path_says_the_right_thing_for_each_build() {
+        let development = no_path_message(true);
+        let release = no_path_message(false);
+        assert!(development.contains("development build of Knock"));
+        assert!(development.contains("KNOCK_CLAUDE_SETTINGS"));
+        // A release build works the path out from the environment (ADR
+        // 0022), so there is nothing for the user to set.
+        assert!(!release.contains("development"));
+        assert!(!release.contains("KNOCK_CLAUDE_SETTINGS"));
+        assert!(release.contains("user folder"));
+        // The build decides, so the user never reads the other build's text.
+        assert_eq!(
+            Problem::NoPath.message(),
+            no_path_message(cfg!(debug_assertions))
+        );
+        // The only way to get it: no path at all.
+        let d = Dir::new();
+        let s = Setup::new(spec(), None, d.0.join("backups"), None);
+        assert_eq!(
+            s.preview().err().map(Problem::message),
+            Some(no_path_message(cfg!(debug_assertions)))
+        );
+    }
+
+    /// The Connect screen and the health check both show this and neither
+    /// has a Repair button, so it says where that button is (deferred
+    /// finding 5 of the 2026-11-06 review).
+    #[test]
+    fn no_server_points_at_repair_in_settings() {
+        let m = Problem::NoServer.message();
+        assert_eq!(
+            m,
+            "Knock isn't listening for Claude Code right now, so it can't connect them yet. Choose Repair in Settings, then try again."
+        );
+        assert!(m.contains("Repair in Settings"));
+        // Every place it can appear: preview and apply on the Connect
+        // screen, and status() behind the health check's hooks line.
+        let d = Dir::new();
+        d.write(b"{}");
+        let s = Setup::new(spec(), Some(d.file()), d.0.join("backups"), None);
+        assert_eq!(s.preview().err(), Some(Problem::NoServer));
+        assert_eq!(s.apply(T), Err(Problem::NoServer));
+        assert_eq!(s.status(), Err(Problem::NoServer));
+        assert_eq!(s.installed(), Err(Problem::NoServer));
+        // Removal needs no server, so it never shows this.
+        assert_ne!(s.remove(T), Err(Problem::NoServer));
     }
 
     /// §11.5: setup logs never hold the file, a token or a path.

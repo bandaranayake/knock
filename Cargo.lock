@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "knock-desktop"
-version = "0.3.0-beta.1"
+version = "0.9.0"
 dependencies = [
  "axum",
  "knock-core",

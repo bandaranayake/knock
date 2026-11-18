@@ -321,6 +321,15 @@ The adapter MUST read only the allow-listed fields (`session_id`, `cwd`, `hook_e
 - A session with no events and no live process for 6 hours is removed. A session whose process was never found counts as having no live process (ADR 0018).
 - Any (state, input) pair not listed above leaves the session unchanged (ADR 0018).
 
+**Restore (FR-13, ADR 0037):**
+
+- At start the app loads the saved snapshot and re-checks each session's process. Simulated sessions are never restored.
+- A session comes back in its saved state, with its animal and its time in state. A `needs_input` episode is the same episode: seen stays seen, and no second `Notify` is sent.
+- A session whose process is gone follows the "Process gone" row above.
+- The escalation and stall clocks restart at start-up. The 6-hour removal rule uses the saved time of the last event.
+- For a restored episode, the first `activity` from any agent closes it.
+- Restoring emits no `Notify`, `Escalate` or `ReadyBatchAdd`. A missing or invalid snapshot means no sessions.
+
 **Deduplication:** a `PermissionRequest` and a `permission_prompt` notification for the same session within 10 s are one episode, with one `Notify`, even if the episode closed in between (ADR 0010). Dedup is per requester (ADR 0019); a prompt without `agentId` matches any requester's request in the last 10 s (ADR 0021). An episode's `needs.kind` is set by the event that opened it.
 
 **Effects:**
@@ -388,6 +397,7 @@ The adapter MUST read only the allow-listed fields (`session_id`, `cwd`, `hook_e
 | `setup_apply_hooks()`, `setup_remove_hooks()` | Write or remove hooks (§8.2)                                                            |
 | `run_health_check()`                          | Returns the checks and their results in plain language                                  |
 | `play_test_knock()`                           | Runs a simulated knock so the user sees what it looks like                              |
+| `get_diagnostics()`                           | Returns `{ version, text }`: the version for Settings, and the text **Copy diagnostics** copies (§11 rule 8, ADR 0038) |
 
 Names are the initial contract; changing them requires an ADR.
 
@@ -593,7 +603,7 @@ Screens in order:
 5. Test knock.
 6. Done.
 
-Every screen uses plain words, explains why, and offers Back. Setup can be reopened from Settings. **Remove Knock from Claude Code** is always one click away in Settings.
+Every screen uses plain words, explains why, and offers Back. Setup opens by itself at start only until the user has answered step 4 once (ADR 0039). Setup can be reopened from Settings. **Remove Knock from Claude Code** is always one click away in Settings.
 
 ### 10.5 Accessibility
 
@@ -628,7 +638,7 @@ Every screen uses plain words, explains why, and offers Back. Setup can be reope
 | UI logic      | Store updates, clip choice per state, den grouping                                                          | Vitest                                         |
 | UI visuals    | Every state × mode (animals, plain) × taskbar (light, dark) × animation effects (on, off)                   | Playwright screenshots against a mocked bridge |
 | Art           | Parts, pivots, clips valid                                                                                  | `pnpm art:check`                               |
-| Smoke         | Install, launch, `knock sim`, read the debug snapshot                                                       | Windows CI runner                              |
+| Smoke         | Launch, `knock sim`, read the debug snapshot. CI builds the installer and checks it exists but does not install it; installing is the user's manual test (§12.2, ADR 0041) | Windows CI runner |
 
 ### 12.2 Manual testing (done by the user)
 
@@ -708,8 +718,7 @@ knock/
 
 | Workflow      | Trigger      | Does                                                                                                                                  |
 | ------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `ci.yml`      | Pull request | `pnpm check`, `pnpm test:visual`, `pnpm art:check`, `cargo-deny`, `pnpm audit`, Windows build, smoke test                             |
-| `nightly.yml` | Push to main | Same, plus an installer artifact                                                                                                      |
+| `ci.yml`      | Pull request | `pnpm check`, `pnpm art:check`, `cargo-deny`, `pnpm audit`, Windows build, smoke test. `pnpm test:visual` runs locally instead: the lead runs it before merging any UI or art change (ADR 0040) |
 | `release.yml` | Tag `v*` (until Phase 6: a manual run from `main` builds the installer into a draft pre-release, ADR 0036) | Build the NSIS installer, sign the update package with the updater key, upload installer plus `latest.json` to a draft GitHub Release |
 
 The installer is unsigned. The user publishes each release by hand.
@@ -721,7 +730,7 @@ The installer is unsigned. The user publishes each release by hand.
 | v0.1        | 2            | User only                             |
 | v0.2        | 3            | User only                             |
 | v0.3-beta.N | 4            | Public, via a GitHub pre-release (ADR 0035) |
-| v0.9        | 5            | Same testers, via auto-update         |
+| v0.9        | 5            | Same testers, downloaded from a GitHub pre-release (ADR 0042) |
 | v1.0        | 6            | Public                                |
 
 Testers MUST be told the installer is unsigned, and asked to check whether Smart App Control is on (it blocks unsigned apps entirely).

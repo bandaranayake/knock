@@ -12,6 +12,14 @@ import {
 	type Written,
 } from "./core";
 import {
+	asDiagnostics,
+	COPIED,
+	type CopyState,
+	copyDiagnostics,
+	type Diagnostics as Diag,
+	versionLabel,
+} from "./diagnostics";
+import {
 	monitorLabel,
 	monitorValue,
 	type Parsed,
@@ -499,6 +507,81 @@ function Health({ onRepair }: { onRepair(): void }) {
 					Check again
 				</button>
 			</div>
+			<Report />
 		</section>
+	);
+}
+
+/** How long "Copied" stays on screen. */
+const COPIED_MS = 8000;
+
+/**
+ * §11 rule 8 and ADR 0038: diagnostics leave Knock only when the user presses this
+ * button, and only onto the clipboard. Nothing is sent anywhere.
+ */
+function Report() {
+	// null until `get_diagnostics()` answers, and if it never does: then no version shows.
+	const [info, setInfo] = useState<Diag | null>(null);
+	const [copy, setCopy] = useState<CopyState>({ kind: "idle" });
+	const [copying, setCopying] = useState(false);
+
+	useEffect(() => {
+		void invoke<unknown>("get_diagnostics").then(
+			(reply) => setInfo(asDiagnostics(reply)),
+			() => {},
+		);
+	}, []);
+
+	// "Copied" is a confirmation, not a state to live in.
+	useEffect(() => {
+		if (copy.kind !== "copied") return;
+		const timer = setTimeout(() => setCopy({ kind: "idle" }), COPIED_MS);
+		return () => clearTimeout(timer);
+	}, [copy]);
+
+	async function run() {
+		setCopying(true);
+		setCopy(await copyDiagnostics(() => invoke<unknown>("get_diagnostics")));
+		setCopying(false);
+	}
+
+	const version = versionLabel(info);
+	return (
+		<div className="report">
+			<h3>Report a problem</h3>
+			{version && <p className="version">{version}</p>}
+			<p className="help">
+				Copy diagnostics puts Knock's version, your Windows version, the results
+				above, your Knock settings, and how many sessions and displays you have
+				on your clipboard, so you can paste them into a bug report. It leaves
+				out anything you or Claude Code wrote, your name, your project names and
+				your file paths, and nothing is sent anywhere.
+			</p>
+			<div className="actions start">
+				<button type="button" onClick={() => void run()} disabled={copying}>
+					{copying ? "Copying…" : "Copy diagnostics"}
+				</button>
+			</div>
+			{/* Always here, so a screen reader announces the confirmation when it appears. */}
+			<p className="copied" role="status">
+				{copy.kind === "copied" ? COPIED : ""}
+			</p>
+			{copy.kind === "failed" && (
+				<>
+					<p className="error" role="alert">
+						{copy.message}
+					</p>
+					{copy.text !== null && (
+						<textarea
+							className="diagnostics"
+							aria-label="Diagnostics to copy"
+							readOnly
+							rows={10}
+							value={copy.text}
+						/>
+					)}
+				</>
+			)}
+		</div>
 	);
 }
